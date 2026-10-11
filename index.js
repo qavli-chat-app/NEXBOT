@@ -189,7 +189,8 @@ async function handleMessage(msg) {
   const isGroup = jid.endsWith('@g.us');
   const senderIsAdmin = isGroup ? await isAdmin(jid, sender) : false;
 
-  const groupConfig = isGroup ? groupSettings(jid) : settings;\n  if (isGroup && groupConfig.antiLink && !senderIsAdmin &&
+  const groupConfig = isGroup ? groupSettings(jid) : settings;
+  if (isGroup && groupConfig.antiLink && !senderIsAdmin &&
       /(?:https?:\/\/|www\.|chat\.whatsapp\.com\/|t\.me\/)/i.test(text)) {
     try {
       await sock.sendMessage(jid, { delete: msg.key });
