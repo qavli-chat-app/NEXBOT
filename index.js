@@ -50,7 +50,7 @@ app.get('/health', (_req, res) => res.json({
   ok: true, name: 'NEXBOT', connected, connectionState,
   qrAvailable: Boolean(latestQR), lastDisconnect, uptimeSeconds: Math.floor(process.uptime())
 }));
-app.get('/', (_req, res) => res.type('html').send(\`<!doctype html>
+app.get('/', (_req, res) => res.type('html').send(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#07111f"><title>NEXBOT — WhatsApp Connect</title>
 <style>
 :root{color-scheme:dark;--bg:#07111f;--panel:#101d30;--line:#26384f;--muted:#9aaec4;--mint:#63f0c0;--blue:#69a7ff}
@@ -74,7 +74,7 @@ async function refreshStatus(){try{const r=await fetch('/health',{cache:'no-stor
 document.getElementById('refresh').addEventListener('click',refreshStatus);
 document.getElementById('connect').addEventListener('click',()=>{const key=keyInput.value.trim();if(!key){showMessage('Enter your PANEL_KEY from Railway Variables first.');keyInput.focus();return;}showMessage('Opening protected QR pairing page…');window.open('/qr?key='+encodeURIComponent(key),'_blank','noopener');});
 refreshStatus();setInterval(refreshStatus,8000);
-</script></body></html>\`));app.get('/qr', async (req, res) => {
+</script></body></html>`));app.get('/qr', async (req, res) => {
   if (!PANEL_KEY || req.query.key !== PANEL_KEY) return res.status(403).type('text').send('Access denied. Configure PANEL_KEY in the hosting environment.');
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   res.set('Pragma', 'no-cache');
