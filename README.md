@@ -1,28 +1,30 @@
 # NEXBOT — WhatsApp Group Moderation Worker
 
-A self-hosted WhatsApp group moderation worker using the unofficial Baileys Web API. It is independent from QAVLI.
+NEXBOT is a separate project from QAVLI. It is a self-hosted WhatsApp group moderation worker using the unofficial Baileys Web API.
 
-## Features
-- Protected QR pairing page and health endpoint
-- Welcome messages
-- Anti-link removal (bot must be group admin)
-- Basic burst anti-spam
-- Admin commands: `!help`, `!ping`, `!tagall`, `!kick @member`, `!warn @member`, `!warnings @member`, `!clearwarn @member`, `!antilink on|off`, `!antispam on|off`, `!welcome on|off`, `!groupinfo`
+## Included
+- Protected QR pairing page at `/qr?key=YOUR_PANEL_KEY`
+- Health endpoint at `/health` and a small status page at `/`
+- Welcome messages when members join
+- Anti-link moderation and basic burst anti-spam
+- Commands: `!help`, `!ping`, `!groupinfo`, `!tagall [message]`, `!kick @member`, `!warn @member`, `!warnings @member`, `!clearwarn @member`, `!antilink on|off`, `!antispam on|off`, `!welcome on|off`
+- Persistent WhatsApp auth and saved warning/settings state when `DATA_DIR` points to a persistent volume
+- Automatic reconnect after temporary connection drops
 
-## Railway setup
-1. Deploy this repository as a Railway service using the Dockerfile.
-2. Add a persistent volume mounted at `/data`. Without it, pairing credentials may be lost on redeploy/restart.
-3. Set `PANEL_KEY` to a long, private random secret.
-4. Set `DATA_DIR=/data`.
-5. Generate a public Railway domain and open `https://YOUR-DOMAIN/qr?key=YOUR_PANEL_KEY`.
-6. On WhatsApp, open Settings → Linked Devices → Link a Device and scan the QR.
-7. Add the bot account to your group and promote it to group admin for link removal and member removal.
-
-Health endpoint: `/health`.
+## Railway deployment
+1. Deploy the `qavli-chat-app/NEXBOT` repository from branch `main`.
+2. Use the repository's `Dockerfile` and Node.js 20 runtime.
+3. Attach a persistent volume mounted at `/data`.
+4. Set `DATA_DIR=/data`, `PORT=3000`, and `PANEL_KEY` to a long random private secret.
+5. Set the Railway health check path to `/health` and expose the service on port 3000.
+6. After the deployment succeeds, open `https://YOUR-DOMAIN/health`. Wait for `qrAvailable: true`, then open `https://YOUR-DOMAIN/qr?key=YOUR_PANEL_KEY`.
+7. In WhatsApp, go to Settings → Linked Devices → Link a Device and scan the private QR.
+8. Add the account to a test group and promote it to group admin for moderation/removal actions.
 
 ## Important
-- This project uses an unofficial WhatsApp Web connection library; WhatsApp may change behavior or restrict accounts. Use responsibly and avoid spam.
-- Never commit the QR, `PANEL_KEY`, or the `/data/auth` session files. Keep the QR page private.
-- This is a first working worker implementation, not a claim that a live session is already connected.
-- Settings and warning counts currently live in memory and reset when the worker restarts.
-- Always test moderation in a small test group first.
+- Do not commit the QR, `PANEL_KEY`, or `/data/auth` session files.
+- Keep the QR page private. Anyone with access to a live pairing QR may link a device.
+- The bot needs group-admin permission for link deletion and member removal. WhatsApp behavior can vary.
+- This uses an unofficial WhatsApp Web connection library; WhatsApp may change behavior or restrict accounts. Use a test/secondary account and follow WhatsApp's terms.
+- The project code being committed does not mean the Railway deployment or WhatsApp session is already live. Verify both before using it in a real group.
+- Test all moderation features in a small test group before relying on them.
