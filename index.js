@@ -277,7 +277,8 @@ async function handleMessage(msg) {
     case 'welcome': {
       const value = (args[0] || '').toLowerCase();
       if (!['on', 'off'].includes(value)) return send(jid, `Usage: ${PREFIX}${command} on|off`);
-      settings.groups ||= {};\n      settings.groups[jid] = { ...groupSettings(jid), [command === 'antilink' ? 'antiLink' : command === 'antispam' ? 'antiSpam' : 'welcome']: value === 'on' };
+      settings.groups ||= {};
+      settings.groups[jid] = { ...groupSettings(jid), [command === 'antilink' ? 'antiLink' : command === 'antispam' ? 'antiSpam' : 'welcome']: value === 'on' };
       saveState();
       return send(jid, `✅ ${command} is now ${value.toUpperCase()} (saved on this worker).`);
     }
