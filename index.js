@@ -447,7 +447,9 @@ async function handleMessage(msg) {
         logger.warn({ err: String(e) }, 'Private-message protection reply failed');
       }
     }
-    return;
+    // Keep private-message protection for ordinary DMs, but always allow explicit
+    // bot commands so the owner can operate and diagnose NEXBOT in a private chat.
+    if (!text.startsWith(PREFIX)) return;
   }
   if (!text) return;
   const senderIsAdmin = isGroup ? await isAdmin(jid, sender) : false;
