@@ -241,6 +241,31 @@ const isAdmin = async (groupJid, userJid) => {
 };
 const send = (jid, text, options = {}) => sock.sendMessage(jid, { text, ...options });
 
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = 'gemini-2.5-flash';
+const aiLastRequest = new Map();
+async function freeModelReply(prompt) {
+  if (!GEMINI_API_KEY || typeof fetch !== 'function') return '';
+  try {
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + encodeURIComponent(GEMINI_API_KEY), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: 'You are NEXBOT, a helpful and safe WhatsApp group assistant. Reply concisely, respectfully, and in the language used by the user. Do not claim to be a human, reveal secrets, or execute admin actions. If unsure, say so. User message: ' + prompt.slice(0, 1500) }] }],
+        generationConfig: { temperature: 0.4, maxOutputTokens: 180 }
+      }), signal: AbortSignal.timeout(12000)
+    });
+    if (!response.ok) {
+      logger.warn({ status: response.status }, 'Free AI provider unavailable; using local fallback');
+      return '';
+    }
+    const data = await response.json();
+    return String(data.candidates?.[0]?.content?.parts?.map(p => p.text || '').join(' ') || '').trim().slice(0, 1200);
+  } catch (e) {
+    logger.warn({ err: String(e) }, 'Free AI request failed; using local fallback');
+    return '';
+  }
+}
+
 async function handleMessage(msg) {
   const jid = msg.key.remoteJid;
   if (!jid || jid === 'status@broadcast' || msg.key.fromMe) return;
@@ -317,9 +342,17 @@ async function handleMessage(msg) {
     const q = text.toLowerCase();
     let answer = '';
     if (['hi','hello','salam','assalam','aoa'].some(word => q === word || q.startsWith(word + ' '))) answer = '👋 Hello! I am NEXBOT group assistant. Ask a clear question, or send !help for commands.';
-    else if (q.includes('who are you') || q.includes('your name')) answer = '🤖 I am NEXBOT, this group’s basic free assistant and moderator.';
+    else if (q.includes('who are you') || q.includes('your name')) answer = '🤖 I am NEXBOT, your group assistant and moderator.';
     else if (q.includes('group rules') || q.includes('who is admin')) answer = '🛡️ Please follow this group’s rules. For group-specific decisions, contact a group admin.';
     else if (q.includes('2+2') || q.includes('2 + 2')) answer = '🧮 2 + 2 = 4';
+    const asksAssistant = /\\bnexbot\\b/i.test(text) || text.includes('?') || /^(what|why|how|when|where|who|can you|please explain|explain|translate|define)\\b/i.test(text);
+    if (!answer && asksAssistant && GEMINI_API_KEY) {
+      const now = Date.now(), last = aiLastRequest.get(jid) || 0;
+      if (now - last >= 4000) {
+        aiLastRequest.set(jid, now);
+        answer = await freeModelReply(text);
+      }
+    }
     if (answer) { try { await send(jid, answer); } catch (e) { logger.warn({err:String(e)}, 'Assistant reply failed'); } }
   }
   if (!text.startsWith(PREFIX)) return;
