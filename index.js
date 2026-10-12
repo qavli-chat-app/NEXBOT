@@ -27,7 +27,9 @@ let reconnectTimer;
 let starting = false;
 const warnings = new Map();
 const recentMessages = new Map();
-const defaults = { antiLink: true, antiSpam: true, welcome: true, antiFlood: true, antiCaps: false, badWords: true, blockMedia: true, aiReplies: false };
+const defaults = { antiLink: true, antiSpam: true, welcome: true, antiFlood: true, antiCaps: false, badWords: true, blockMedia: true, aiReplies: false, privateMessageProtection: true };
+const PRIVATE_REPLY = 'I am not accepting private messages. Please do not message me.';
+const privateReplyCooldown = new Map();
 let settings = { ...defaults, groups: {} };
 
 try {
@@ -52,6 +54,18 @@ function panelAuthorized(req) {
 }
 function groupSettings(jid) { return { ...defaults, ...(settings.groups?.[jid] || {}) }; }
 app.use(express.json({ limit: '32kb' }));
+app.get('/api/private-protection', (req, res) => {
+  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
+  res.set('Cache-Control', 'no-store');
+  res.json({ enabled: settings.privateMessageProtection !== false, reply: PRIVATE_REPLY });
+});
+app.patch('/api/private-protection', (req, res) => {
+  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
+  if (typeof req.body?.enabled !== 'boolean') return res.status(400).json({ error: 'enabled must be true or false' });
+  settings.privateMessageProtection = req.body.enabled;
+  saveState();
+  res.json({ ok: true, enabled: settings.privateMessageProtection, reply: PRIVATE_REPLY });
+});
 app.get('/api/ai-status', (req, res) => {
   if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
   res.set('Cache-Control', 'no-store');
@@ -406,6 +420,20 @@ async function handleMessage(msg) {
     return;
   }
   if (!text) return;
+  if (!isGroup && settings.privateMessageProtection !== false && !msg.key.fromMe) {
+    const now = Date.now();
+    const lastReply = privateReplyCooldown.get(sender) || 0;
+    // Reply once per sender every 24 hours to avoid repeated automated messages.
+    if (now - lastReply >= 24 * 60 * 60 * 1000) {
+      try {
+        await send(jid, PRIVATE_REPLY);
+        privateReplyCooldown.set(sender, now);
+      } catch (e) {
+        logger.warn({ err: String(e) }, 'Private-message protection reply failed');
+      }
+    }
+    return;
+  }
   const senderIsAdmin = isGroup ? await isAdmin(jid, sender) : false;
 
   const groupConfig = isGroup ? groupSettings(jid) : settings;
