@@ -22,12 +22,14 @@ app.use(express.json({ limit: '100kb' }));
 
 let sock = null, latestQR = '', connected = false, connectionState = 'starting';
 let lastDisconnect = null, starting = false, reconnectTimer = null, startedAt = Date.now();
-let settings = { antiLink: true, antiSpam: true, welcome: true, groups: {} };
+let settings = { antiLink: true, antiSpam: true, welcome: true, privateProtection: true, groups: {}, warnings: {}, rules: {} };
 let messageCount = 0, commandCount = 0, lastMessageAt = null;
+const recentMessages = new Map(), privateReplyAt = new Map(), commandCooldown = new Map();
+const cooldown = (key, ms) => { const now=Date.now(), prev=commandCooldown.get(key)||0; if(now-prev<ms) return false; commandCooldown.set(key,now); return true; };
 try {
   if (fs.existsSync(STATE_FILE)) {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {} };
+    settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {}, warnings: s.settings?.warnings || {}, rules: s.settings?.rules || {} };
   }
 } catch (e) { logger.warn({ err: String(e) }, 'Could not load saved settings'); }
 function saveState() {
@@ -58,7 +60,7 @@ app.get('/api/qr', auth, async (_req,res) => {
   catch { res.status(500).json({ error:'QR generation failed' }); }
 });
 app.post('/api/settings', auth, (req,res) => {
-  const allowed = ['antiLink','antiSpam','welcome'];
+  const allowed = ['antiLink','antiSpam','welcome','privateProtection'];
   for (const key of allowed) if (typeof req.body?.[key] === 'boolean') settings[key] = req.body[key];
   saveState(); res.json({ ok:true, settings });
 });
@@ -77,6 +79,10 @@ async function saveSettings(){try{let b={};for(let k of ['antiLink','antiSpam','
 
 const groupDefaults = { antiLink: settings.antiLink, antiSpam: settings.antiSpam, welcome: settings.welcome };
 function groupSettings(id) { return { ...groupDefaults, ...(settings.groups[id] || {}) }; }
+function warnKey(groupId, userId) { return groupId + '|' + userId; }
+function getWarnings(groupId,userId) { return settings.warnings[warnKey(groupId,userId)] || []; }
+function addWarning(groupId,userId,by,reason) { const k=warnKey(groupId,userId); const arr=getWarnings(groupId,userId); arr.push({by,reason:reason||'No reason provided',at:new Date().toISOString()}); settings.warnings[k]=arr.slice(-20); saveState(); return settings.warnings[k]; }
+function parseTargets(msg) { return [...new Set([...mentionedJids(msg), ...(msg.message?.extendedTextMessage?.contextInfo?.participant ? [msg.message.extendedTextMessage.contextInfo.participant] : [])])]; }
 function isAdmin(meta, jid) { return meta?.participants?.some(p => p.id === jid && (p.admin === 'admin' || p.admin === 'superadmin')); }
 function mentionedJids(msg) {
   const ctx = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo || {};
@@ -135,32 +141,73 @@ async function startBot() {
           const isGroup = jid.endsWith('@g.us');
           let meta = null;
           if (isGroup) { try { meta = await sock.groupMetadata(jid); } catch {} }
-          if (isGroup && await moderateLink(msg, jid, meta)) continue;
-          if (!text.startsWith(PREFIX)) {
-            if (!isGroup && jid.endsWith('@s.whatsapp.net')) {
-              // Normal private messages are ignored; commands remain available.
+          const sender = msg.key.participant || jid;
+          if (isGroup) {
+            const gs = groupSettings(jid);
+            if (gs.antiSpam) {
+              const key = jid + '|' + sender, now = Date.now();
+              const arr = (recentMessages.get(key) || []).filter(t => now-t < 8000);
+              arr.push(now); recentMessages.set(key, arr);
+              if (arr.length >= 6 && !isAdmin(meta,sender)) {
+                recentMessages.set(key, []);
+                await sendText(jid, '⚠️ Please slow down; anti-spam detected rapid messages.', msg);
+                if (isAdmin(meta, sock.user?.id?.split(':')[0] + '@s.whatsapp.net')) {
+                  try { await sock.sendMessage(jid,{delete:msg.key}); } catch {}
+                }
+                continue;
+              }
+            }
+            if (await moderateLink(msg, jid, meta)) continue;
+          }
+          if (!isGroup && settings.privateProtection && !text.startsWith(PREFIX)) {
+            const now=Date.now(), last=privateReplyAt.get(sender)||0;
+            if (now-last > 24*60*60*1000) {
+              privateReplyAt.set(sender,now);
+              await sendText(jid,'I am not accepting private messages. Please do not message me.',msg).catch(()=>{});
             }
             continue;
           }
+          if (!text.startsWith(PREFIX)) continue;
           commandCount++;
           const parts = text.slice(PREFIX.length).trim().split(/\s+/);
           const cmd = (parts.shift() || '').toLowerCase(), args = parts;
-          const sender = msg.key.participant || jid;
           const senderIsAdmin = isGroup ? isAdmin(meta, sender) : (OWNER && sender.replace(/\D/g,'').includes(OWNER));
           const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
           const botIsAdmin = isGroup && isAdmin(meta, botJid);
           const reply = t => sendText(jid, t, msg);
           if (cmd === 'ping') await reply('🏓 Pong! NEXBOT Pro is online. Connection: ' + connectionState);
-          else if (cmd === 'help' || cmd === 'menu') await reply('⚡ NEXBOT Pro commands\n' + PREFIX + 'ping — health\n' + PREFIX + 'help — commands\n' + PREFIX + 'rules — group rules\n' + PREFIX + 'groupinfo — group details\n' + PREFIX + 'admins — list admins\n' + PREFIX + 'kick @user — remove member (admin)\n' + PREFIX + 'promote @user / ' + PREFIX + 'demote @user (admin)\n' + PREFIX + 'tagall — mention members (admin)\n' + PREFIX + 'antilink on|off — group setting (admin)\n' + PREFIX + 'antispam on|off — group setting (admin)');
-          else if (cmd === 'rules') await reply('📌 Group rules\n1. Be respectful.\n2. No spam or unsolicited links.\n3. Follow group admin guidance.');
-          else if (cmd === 'groupinfo' && isGroup) await reply('👥 ' + meta.subject + '\nMembers: ' + meta.participants.length + '\nAdmins: ' + meta.participants.filter(p=>p.admin).length);
-          else if (cmd === 'admins' && isGroup) await reply('🛡️ Group admins: ' + meta.participants.filter(p=>p.admin).map(p=>'@'+p.id.split('@')[0]).join(', '));
-          else if (['kick','promote','demote','tagall','antilink','antispam'].includes(cmd)) {
+          else if (cmd === 'help' || cmd === 'menu') await reply('⚡ NEXBOT PRO — COMMAND MENU\n' + PREFIX + 'ping, status, help, menu\n' + PREFIX + 'rules | ' + PREFIX + 'groupinfo | ' + PREFIX + 'admins\n' + PREFIX + 'kick @user | promote @user | demote @user\n' + PREFIX + 'warn @user [reason] | warnings @user | clearwarn @user\n' + PREFIX + 'tagall [message] | ' + PREFIX + 'setrules [text]\n' + PREFIX + 'antilink on/off | antispam on/off | welcome on/off\n' + PREFIX + 'subject [new name] | description [text]\n' + PREFIX + 'privateprotection on/off (owner)\n' + PREFIX + 'ai [question] (if AI key configured)\nAdmin actions require group-admin rights and bot-admin rights where applicable.');
+          else if (cmd === 'rules') await reply('📌 Group rules\n' + (isGroup ? (settings.rules[jid] || '1. Be respectful.\n2. No spam or unsolicited links.\n3. Follow group admin guidance.') : 'Be respectful, avoid spam, and protect your privacy.'));
+          else if (cmd === 'groupinfo' && isGroup) await reply('👥 ' + meta.subject + '\\nID: ' + jid + '\\nMembers: ' + meta.participants.length + '\\nAdmins: ' + meta.participants.filter(p=>p.admin).length + '\\nCreated/description details depend on WhatsApp metadata.');
+          else if (cmd === 'admins' && isGroup) await sock.sendMessage(jid,{text:'🛡️ Group admins: ' + meta.participants.filter(p=>p.admin).map(p=>'@'+p.id.split('@')[0]).join(', '),mentions:meta.participants.filter(p=>p.admin).map(p=>p.id)},{quoted:msg});
+          else if (cmd === 'status') await reply('NEXBOT Pro: ' + connectionState + '\\nMessages: ' + messageCount + '\\nCommands: ' + commandCount + '\\nUptime: ' + Math.floor((Date.now()-startedAt)/1000) + ' seconds');
+          else if (cmd === 'privateprotection') {
+            if (!OWNER || sender.replace(/\\D/g,'') !== OWNER) { await reply('⛔ Owner-only command. Configure BOT_OWNER in Railway variables.'); continue; }
+            const value=(args[0]||'').toLowerCase(); if(!['on','off'].includes(value)){await reply('Usage: '+PREFIX+'privateprotection on|off');continue;}
+            settings.privateProtection=value==='on'; saveState(); await reply('✅ Private-message protection '+value+'.');
+          }
+          else if (cmd === 'ai') {
+            const question=args.join(' '); const apiKey=process.env.OPENROUTER_API_KEY;
+            if(!question){await reply('Usage: '+PREFIX+'ai your question');continue;}
+            if(!apiKey){await reply('AI is not configured. Add an OpenRouter API key in Railway Variables; provider usage may have limits/costs.');continue;}
+            if(!cooldown('ai:'+sender,10000)){await reply('Please wait a few seconds before asking AI again.');continue;}
+            try { const resp=await fetch('https://openrouter.ai/api/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+apiKey,'Content-Type':'application/json'},body:JSON.stringify({model:process.env.AI_MODEL||'openrouter/auto',messages:[{role:'system',content:'You are NEXBOT, a helpful concise WhatsApp assistant. Follow safety rules.'},{role:'user',content:question}],max_tokens:700})}); const data=await resp.json(); const answer=data.choices?.[0]?.message?.content; await reply(answer ? String(answer).slice(0,3500) : 'AI provider returned no answer. Check key, model and provider limits.'); } catch(e){logger.warn({err:String(e)},'AI request failed');await reply('AI request failed. Please try later.');}
+          }
+          else if (['kick','promote','demote','tagall','antilink','antispam','welcome','warn','warnings','clearwarn','setrules','subject','description'].includes(cmd)) {
             if (!isGroup) { await reply('This command only works in groups.'); continue; }
             if (!senderIsAdmin && sender.replace(/\D/g,'') !== OWNER) { await reply('⛔ Only group admins can use this command.'); continue; }
             if (!botIsAdmin) { await reply('⚠️ Please make NEXBOT an admin first.'); continue; }
-            const targets = mentionedJids(msg);
-            if (cmd === 'kick' || cmd === 'promote' || cmd === 'demote') {
+            const targets = parseTargets(msg);
+            if (cmd === 'setrules') { const ruleText=args.join(' ').trim(); if(!ruleText){await reply('Usage: '+PREFIX+'setrules your group rules');continue;} settings.rules[jid]=ruleText.slice(0,2000);saveState();await reply('✅ Group rules updated.'); }
+            else if (cmd === 'subject' || cmd === 'description') { const value=args.join(' ').trim();if(!value){await reply('Provide new '+cmd+'.');continue;} if(cmd==='subject') await sock.groupUpdateSubject(jid,value.slice(0,100)); else await sock.groupUpdateDescription(jid,value.slice(0,2048)); await reply('✅ Group '+cmd+' updated.'); }
+            else if (cmd === 'warn' || cmd === 'warnings' || cmd === 'clearwarn') {
+              if(!targets.length){await reply('Mention or reply to a member.');continue;}
+              const target=targets[0], key=warnKey(jid,target);
+              if(cmd==='warn'){const arr=addWarning(jid,target,sender,args.filter(x=>!x.startsWith('@')).join(' '));await reply('⚠️ Warning added for @'+target.split('@')[0]+'. Total warnings: '+arr.length);if(arr.length>=3) await reply('🚨 This member has reached 3 warnings. Admins may review.');}
+              else if(cmd==='warnings'){const arr=getWarnings(jid,target);await reply('📋 Warnings for @'+target.split('@')[0]+': '+arr.length+'\\n'+arr.map((w,i)=>(i+1)+'. '+w.reason+' ('+w.at.slice(0,10)+')').join('\\n'));}
+              else {delete settings.warnings[key];saveState();await reply('✅ Warnings cleared for @'+target.split('@')[0]+'.');}
+            }
+            else if (cmd === 'kick' || cmd === 'promote' || cmd === 'demote') {
               if (!targets.length) { await reply('Mention the member, for example: ' + PREFIX + cmd + ' @member'); continue; }
               const action = cmd === 'kick' ? 'remove' : cmd;
               await sock.groupParticipantsUpdate(jid, targets, action);
@@ -171,7 +218,8 @@ async function startBot() {
             } else {
               const value = (args[0] || '').toLowerCase();
               if (!['on','off'].includes(value)) { await reply('Usage: ' + PREFIX + cmd + ' on|off'); continue; }
-              settings.groups[jid] = { ...groupSettings(jid), [cmd === 'antilink' ? 'antiLink' : 'antiSpam']: value === 'on' };
+              const field = cmd === 'antilink' ? 'antiLink' : cmd === 'antispam' ? 'antiSpam' : 'welcome';
+              settings.groups[jid] = { ...groupSettings(jid), [field]: value === 'on' };
               saveState(); await reply('✅ ' + cmd + ' ' + value + ' for this group.');
             }
           } else if (cmd === 'status') await reply('NEXBOT Pro: ' + connectionState + '\nMessages: ' + messageCount + '\nCommands: ' + commandCount);
