@@ -22,14 +22,14 @@ app.use(express.json({ limit: '100kb' }));
 
 let sock = null, latestQR = '', connected = false, connectionState = 'starting';
 let lastDisconnect = null, starting = false, reconnectTimer = null, startedAt = Date.now();
-let settings = { antiLink: true, antiSpam: true, welcome: true, privateProtection: true, groups: {}, warnings: {}, rules: {} };
+let settings = { antiLink: true, antiSpam: true, welcome: true, privateProtection: true, groups: {}, warnings: {}, rules: {}, customReplies: {}, blockedWords: {} };
 let messageCount = 0, commandCount = 0, lastMessageAt = null;
 const recentMessages = new Map(), privateReplyAt = new Map(), commandCooldown = new Map();
 const cooldown = (key, ms) => { const now=Date.now(), prev=commandCooldown.get(key)||0; if(now-prev<ms) return false; commandCooldown.set(key,now); return true; };
 try {
   if (fs.existsSync(STATE_FILE)) {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {}, warnings: s.settings?.warnings || {}, rules: s.settings?.rules || {} };
+    settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {}, warnings: s.settings?.warnings || {}, rules: s.settings?.rules || {}, customReplies: s.settings?.customReplies || {}, blockedWords: s.settings?.blockedWords || {} };
   }
 } catch (e) { logger.warn({ err: String(e) }, 'Could not load saved settings'); }
 function saveState() {
@@ -221,6 +221,12 @@ async function startBot() {
               }
             }
             if (await moderateLink(msg, jid, meta)) continue;
+            const bad = settings.blockedWords[jid] || [];
+            if (text && bad.some(w => w && new RegExp('(^|[^\\p{L}\\p{N}])' + w.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\if (await moderateLink(msg, jid, meta)) continue;') + '([^\\p{L}\\p{N}]|$)', 'iu').test(text)) && !isAdmin(meta, sender)) {
+              if (isAdmin(meta, sock.user?.id?.split(':')[0] + '@s.whatsapp.net')) await sock.sendMessage(jid, { delete: msg.key }).catch(() => {});
+              await sendText(jid, '⚠️ Please keep the group respectful and follow its rules.', msg);
+              continue;
+            }
           }
           if (!isGroup && settings.privateProtection && !text.startsWith(PREFIX)) {
             const now=Date.now(), last=privateReplyAt.get(sender)||0;
@@ -230,7 +236,14 @@ async function startBot() {
             }
             continue;
           }
-          if (!text.startsWith(PREFIX)) continue;
+          if (!text.startsWith(PREFIX)) {
+            if (isGroup && text) {
+              const replies = settings.customReplies[jid] || {};
+              const answer = replies[text.toLowerCase().trim()];
+              if (answer && cooldown('custom:' + jid + ':' + sender, 3000)) await sendText(jid, answer, msg).catch(() => {});
+            }
+            continue;
+          }
           commandCount++;
           const parts = text.slice(PREFIX.length).trim().split(/\s+/);
           const cmd = (parts.shift() || '').toLowerCase(), args = parts;
@@ -239,7 +252,7 @@ async function startBot() {
           const botIsAdmin = isGroup && isAdmin(meta, botJid);
           const reply = t => sendText(jid, t, msg);
           if (cmd === 'ping') await reply('🏓 Pong! NEXBOT Pro is online. Connection: ' + connectionState);
-          else if (cmd === 'help' || cmd === 'menu') await reply('⚡ NEXBOT PRO — COMMAND MENU\n' + PREFIX + 'ping, status, help, menu\n' + PREFIX + 'rules | ' + PREFIX + 'groupinfo | ' + PREFIX + 'admins\n' + PREFIX + 'kick @user | promote @user | demote @user\n' + PREFIX + 'warn @user [reason] | warnings @user | clearwarn @user\n' + PREFIX + 'tagall [message] | ' + PREFIX + 'setrules [text]\n' + PREFIX + 'antilink on/off | antispam on/off | welcome on/off\n' + PREFIX + 'subject [new name] | description [text]\n' + PREFIX + 'privateprotection on/off (owner)\n' + PREFIX + 'ai [question] (if AI key configured)\nAdmin actions require group-admin rights and bot-admin rights where applicable.');
+          else if (cmd === 'help' || cmd === 'menu') await reply('⚡ NEXBOT PRO — COMMAND MENU\n' + PREFIX + 'ping | status | help | menu\n' + PREFIX + 'rules | groupinfo | admins\n' + PREFIX + 'kick @user | promote @user | demote @user | tagall\n' + PREFIX + 'warn @user [reason] | warnings @user | clearwarn @user (3 warnings removes member)\n' + PREFIX + 'setrules [text] | subject [name] | description [text]\n' + PREFIX + 'antilink on/off | antispam on/off | welcome on/off\n' + PREFIX + 'addreply trigger | response | delreply trigger | replies\n' + PREFIX + 'badword add word | badword remove word | badwords\n' + PREFIX + 'ai [question] (optional provider key)\nAdmin commands require group-admin rights; the bot must also be a group admin for moderation.');
           else if (cmd === 'rules') await reply('📌 Group rules\n' + (isGroup ? (settings.rules[jid] || '1. Be respectful.\n2. No spam or unsolicited links.\n3. Follow group admin guidance.') : 'Be respectful, avoid spam, and protect your privacy.'));
           else if (cmd === 'groupinfo' && isGroup) await reply('👥 ' + meta.subject + '\\nID: ' + jid + '\\nMembers: ' + meta.participants.length + '\\nAdmins: ' + meta.participants.filter(p=>p.admin).length + '\\nCreated/description details depend on WhatsApp metadata.');
           else if (cmd === 'admins' && isGroup) await sock.sendMessage(jid,{text:'🛡️ Group admins: ' + meta.participants.filter(p=>p.admin).map(p=>'@'+p.id.split('@')[0]).join(', '),mentions:meta.participants.filter(p=>p.admin).map(p=>p.id)},{quoted:msg});
@@ -248,6 +261,23 @@ async function startBot() {
             if (!OWNER || sender.replace(/\D/g,'') !== OWNER) { await reply('⛔ Owner-only command. Configure BOT_OWNER in Railway variables.'); continue; }
             const value=(args[0]||'').toLowerCase(); if(!['on','off'].includes(value)){await reply('Usage: '+PREFIX+'privateprotection on|off');continue;}
             settings.privateProtection=value==='on'; saveState(); await reply('✅ Private-message protection '+value+'.');
+          }
+          else if (cmd === 'replies') { const list = settings.customReplies[jid] || {}; await reply('🧩 Custom replies:\n' + (Object.keys(list).length ? Object.keys(list).map(k => k + ' → ' + list[k]).join('\n') : 'No custom replies yet. Add one with ' + PREFIX + 'addreply trigger | response')); }
+          else if (cmd === 'addreply' || cmd === 'delreply') {
+            if (!isGroup || (!senderIsAdmin && sender.replace(/\\D/g,'') !== OWNER)) { await reply('⛔ Only group admins can manage custom replies in a group.'); continue; }
+            const raw = args.join(' '), partsReply = raw.split('|').map(x => x.trim());
+            if (cmd === 'addreply') { if (partsReply.length < 2 || !partsReply[0] || !partsReply[1]) { await reply('Usage: ' + PREFIX + 'addreply trigger | response'); continue; } settings.customReplies[jid] = settings.customReplies[jid] || {}; settings.customReplies[jid][partsReply[0].toLowerCase().slice(0,60)] = partsReply.slice(1).join(' | ').slice(0,1000); saveState(); await reply('✅ Custom reply saved.'); }
+            else { const trigger = raw.toLowerCase().trim(); if (!settings.customReplies[jid]?.[trigger]) { await reply('No matching trigger found. Use ' + PREFIX + 'replies'); continue; } delete settings.customReplies[jid][trigger]; saveState(); await reply('✅ Custom reply removed.'); }
+          }
+          else if (cmd === 'badwords' || cmd === 'badword') {
+            if (!isGroup || (!senderIsAdmin && sender.replace(/\\D/g,'') !== OWNER)) { await reply('⛔ Only group admins can manage blocked words.'); continue; }
+            if (cmd === 'badwords') { await reply('🚫 Blocked words: ' + ((settings.blockedWords[jid] || []).join(', ') || 'none')); continue; }
+            const action = (args.shift() || '').toLowerCase(), word = args.join(' ').trim().toLowerCase();
+            if (!['add','remove'].includes(action) || !word || word.length > 40 || /[\\r\\n]/.test(word)) { await reply('Usage: ' + PREFIX + 'badword add word OR ' + PREFIX + 'badword remove word'); continue; }
+            settings.blockedWords[jid] = settings.blockedWords[jid] || [];
+            if (action === 'add') { if (!settings.blockedWords[jid].includes(word)) settings.blockedWords[jid].push(word); }
+            else settings.blockedWords[jid] = settings.blockedWords[jid].filter(w => w !== word);
+            saveState(); await reply('✅ Blocked-word list updated.');
           }
           else if (cmd === 'ai') {
             const question=args.join(' '); const apiKey=process.env.OPENROUTER_API_KEY;
@@ -266,7 +296,7 @@ async function startBot() {
             else if (cmd === 'warn' || cmd === 'warnings' || cmd === 'clearwarn') {
               if(!targets.length){await reply('Mention or reply to a member.');continue;}
               const target=targets[0], key=warnKey(jid,target);
-              if(cmd==='warn'){const arr=addWarning(jid,target,sender,args.filter(x=>!x.startsWith('@')).join(' '));await reply('⚠️ Warning added for @'+target.split('@')[0]+'. Total warnings: '+arr.length);if(arr.length>=3) await reply('🚨 This member has reached 3 warnings. Admins may review.');}
+              if(cmd==='warn'){const arr=addWarning(jid,target,sender,args.filter(x=>!x.startsWith('@')).join(' '));await reply('⚠️ Warning added for @'+target.split('@')[0]+'. Total warnings: '+arr.length);if(arr.length>=3){const targetIsAdmin=isAdmin(meta,target);if(!targetIsAdmin && target!==botJid){try{await sock.groupParticipantsUpdate(jid,[target],'remove');delete settings.warnings[key];saveState();await reply('🚨 Three warnings reached. Member removed; warning counter reset.');}catch{await reply('🚨 Three warnings reached, but WhatsApp did not allow removal. Please review manually.');}}else await reply('🚨 Three warnings reached. Admins are protected from automatic removal.');}}
               else if(cmd==='warnings'){const arr=getWarnings(jid,target);await reply('📋 Warnings for @'+target.split('@')[0]+': '+arr.length+'\\n'+arr.map((w,i)=>(i+1)+'. '+w.reason+' ('+w.at.slice(0,10)+')').join('\\n'));}
               else {delete settings.warnings[key];saveState();await reply('✅ Warnings cleared for @'+target.split('@')[0]+'.');}
             }
