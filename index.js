@@ -242,7 +242,7 @@ const isAdmin = async (groupJid, userJid) => {
 const send = (jid, text, options = {}) => sock.sendMessage(jid, { text, ...options });
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 const aiLastRequest = new Map();
 async function freeModelReply(prompt) {
   if (!GEMINI_API_KEY || typeof fetch !== 'function') return '';
