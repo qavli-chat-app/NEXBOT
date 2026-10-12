@@ -419,7 +419,6 @@ async function handleMessage(msg) {
     catch (e) { logger.warn({err:String(e)}, 'Could not remove blocked media; NEXBOT may need group admin rights'); }
     return;
   }
-  if (!text) return;
   if (!isGroup && settings.privateMessageProtection !== false && !msg.key.fromMe) {
     const now = Date.now();
     const lastReply = privateReplyCooldown.get(sender) || 0;
@@ -434,6 +433,7 @@ async function handleMessage(msg) {
     }
     return;
   }
+  if (!text) return;
   const senderIsAdmin = isGroup ? await isAdmin(jid, sender) : false;
 
   const groupConfig = isGroup ? groupSettings(jid) : settings;
