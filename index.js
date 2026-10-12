@@ -379,7 +379,7 @@ async function handleMessage(msg) {
     else if (q.includes('who are you') || q.includes('your name')) answer = '🤖 I am NEXBOT, your group assistant and moderator.';
     else if (q.includes('group rules') || q.includes('who is admin')) answer = '🛡️ Please follow this group’s rules. For group-specific decisions, contact a group admin.';
     else if (q.includes('2+2') || q.includes('2 + 2')) answer = '🧮 2 + 2 = 4';
-    const asksAssistant = /\\bnexbot\\b/i.test(text) || text.includes('?') || /^(what|why|how|when|where|who|can you|please explain|explain|translate|define)\\b/i.test(text);
+    const asksAssistant = /\bnexbot\b/i.test(text) || text.includes('?') || /^(what|why|how|when|where|who|can you|please explain|explain|translate|define)\b/i.test(text);
     if (!answer && asksAssistant && OPENROUTER_API_KEY) {
       const now = Date.now(), last = aiLastRequest.get(jid) || 0;
       if (now - last >= 4000) {
