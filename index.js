@@ -227,10 +227,6 @@ async function startBot() {
               await sendText(jid, '⚠️ Please keep the group respectful and follow its rules.', msg);
               continue;
             }
-              if (isAdmin(meta, sock.user?.id?.split(':')[0] + '@s.whatsapp.net')) await sock.sendMessage(jid, { delete: msg.key }).catch(() => {});
-              await sendText(jid, '⚠️ Please keep the group respectful and follow its rules.', msg);
-              continue;
-            }
           }
           if (!isGroup && settings.privateProtection && !text.startsWith(PREFIX)) {
             const now=Date.now(), last=privateReplyAt.get(sender)||0;
