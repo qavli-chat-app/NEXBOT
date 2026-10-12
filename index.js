@@ -94,6 +94,40 @@ app.get('/api/groups/:id', async (req, res) => {
     });
   } catch { res.status(404).json({error:'Group not found or bot is not a member.'}); }
 });
+const groupMessageStore = new Map();
+function rememberGroupMessage(jid, item) {
+  if (!jid?.endsWith('@g.us')) return;
+  const list = groupMessageStore.get(jid) || [];
+  list.push(item);
+  if (list.length > 250) list.splice(0, list.length - 250);
+  groupMessageStore.set(jid, list);
+}
+app.get('/api/groups/:id/messages', async (req, res) => {
+  if (!panelAuthorized(req)) return res.status(403).json({error:'Unauthorized panel key'});
+  if (!connected || !sock) return res.status(503).json({error:'WhatsApp is not connected.'});
+  const id = String(req.params.id);
+  if (!id.endsWith('@g.us')) return res.status(400).json({error:'Invalid group id'});
+  try { await sock.groupMetadata(id); } catch { return res.status(404).json({error:'Group not found or bot is not a member.'}); }
+  const after = Number(req.query.after || 0);
+  res.set('Cache-Control','no-store');
+  res.json({messages:(groupMessageStore.get(id)||[]).filter(m=>m.time>after).slice(-100)});
+});
+app.post('/api/groups/:id/messages', async (req, res) => {
+  if (!panelAuthorized(req)) return res.status(403).json({error:'Unauthorized panel key'});
+  if (!connected || !sock) return res.status(503).json({error:'WhatsApp is not connected.'});
+  const id = String(req.params.id), message = String(req.body?.message || '').trim();
+  if (!id.endsWith('@g.us')) return res.status(400).json({error:'Invalid group id'});
+  if (!message || message.length > 4000) return res.status(400).json({error:'Message must be 1–4000 characters.'});
+  try {
+    const meta = await sock.groupMetadata(id);
+    const bot = meta.participants.find(p => jidNumber(p.id) === jidNumber(sock.user?.id));
+    if (!bot || !['admin','superadmin'].includes(bot.admin)) return res.status(403).json({error:'Make NEXBOT a group admin first to send from this control panel.'});
+    await sock.sendMessage(id,{text:message});
+    const item={id:'panel-'+Date.now(),time:Date.now(),sender:'NEXBOT · Control Panel',text:message,fromMe:true};
+    rememberGroupMessage(id,item);
+    return res.json({ok:true,message:'Message sent to selected group.',item});
+  } catch(e) { logger.warn({err:String(e)},'Panel group message failed'); return res.status(500).json({error:'Could not send group message. Check NEXBOT admin permission.'}); }
+});
 app.post('/api/send-message', async (req, res) => {
   if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
   if (!connected || !sock) return res.status(503).json({ error: 'WhatsApp is not connected.' });
@@ -205,7 +239,7 @@ app.get('/dashboard', (_req, res) => res.type('html').send(`<!doctype html><html
 <label for="aiTestPrompt">Test AI reply</label><textarea id="aiTestPrompt" class="field" rows="2" maxlength="1000" placeholder="Ask a simple question to test the assistant"></textarea><button type="button" id="testAI">🧪 Test assistant now</button><div id="aiTestResult" class="status" role="status"></div>
 <p class="notice">To enable replies, select a group below and turn on “Basic free assistant replies”. Keep any paid credits or upgrades disabled if you want to use only free models.</p>
 </section>
-<section class="card"><label>Select one group</label><select id="groups"><option value="">Load groups first</option></select><div id="groupInfo" class="muted">Choose a group to view settings and members.</div><div class="row"><button type="button" class="secondary" id="refreshAdmin">Refresh admin status</button></div><p class="notice">To make NEXBOT an admin: open this group in WhatsApp → tap the group name → participants → select NEXBOT → Make group admin. Only an existing group admin can do this.</p></section><section class="card"><h3>Moderation settings — selected group only</h3><label class="toggle">Anti-link <input type="checkbox" id="antiLink"></label><label class="toggle">Anti-spam <input type="checkbox" id="antiSpam"></label><label class="toggle">Welcome new members <input type="checkbox" id="welcome"></label><label class="toggle">Anti-flood <input type="checkbox" id="antiFlood"></label><label class="toggle">Anti-caps spam <input type="checkbox" id="antiCaps"></label><label class="toggle">Bad-word filter <input type="checkbox" id="badWords"></label><label class="toggle">Block all member media (images, videos, stickers, files) <input type="checkbox" id="blockMedia"></label><button id="save">Save settings for this group</button><p class="notice">Anti-link and anti-spam may delete messages; NEXBOT needs group admin rights. Changes do not apply to other groups.</p></section><section class="card" style="border:2px solid #63f0c0;background:linear-gradient(135deg,#123c3a,#101e30);text-align:center"><h2 style="margin:0 0 8px;font-size:26px">👑 Make NEXBOT Admin</h2><p class="muted">One tap sends a clear admin request to this selected WhatsApp group and mentions current admins. An existing admin still has to approve it in WhatsApp.</p><button id="makeAdmin" style="width:100%;padding:19px;font-size:20px;border-radius:16px;background:linear-gradient(90deg,#63f0c0,#7ab6ff);color:#061820">👑 MAKE ME ADMIN</button></section><section class="card"><h3>Group admin tools</h3><p class="muted">These actions affect only the selected group and require NEXBOT admin rights where indicated.</p><div class="row"><button class="secondary" data-groupact="getInviteCode">Get invite link</button><button class="secondary" data-groupact="revokeInvite" data-confirm="yes">Reset invite link</button></div><div class="row"><button class="secondary" data-groupact="announceOn" data-confirm="yes">Admins-only messages</button><button class="secondary" data-groupact="announceOff" data-confirm="yes">Allow all messages</button></div><div class="row"><button class="secondary" data-groupact="editInfoOn">Lock group info</button><button class="secondary" data-groupact="editInfoOff">Unlock group info</button><button class="secondary" data-groupact="getDescription">View group description</button></div><h4>Member-add permissions</h4><div class="row"><button class="secondary" data-groupact="memberAddAdmins">Admins add members</button><button class="secondary" data-groupact="memberAddAll">Allow members to add</button></div><h4>Join approvals</h4><div class="row"><button class="secondary" data-groupact="joinApprovalOn">Require join approval</button><button class="secondary" data-groupact="joinApprovalOff">Disable join approval</button></div><h4>Disappearing messages</h4><div class="row"><button class="secondary" data-groupact="ephemeralOff">Off</button><button class="secondary" data-groupact="ephemeral24h">24 hours</button><button class="secondary" data-groupact="ephemeral7d">7 days</button><button class="secondary" data-groupact="ephemeral90d">90 days</button></div></section><section class="card" style="border:2px solid #63a7ff"><h2 style="margin-top:0">✉️ Send WhatsApp Message</h2><p class="muted">Send a message from NEXBOT's linked WhatsApp account to one number. Enter the international country code, for example Pakistan: 923001234567. Only message people you are allowed to contact.</p><label>Recipient phone number (country code included)</label><input id="recipientNumber" class="field" inputmode="numeric" autocomplete="off" placeholder="923001234567"><label>Message</label><textarea id="outgoingMessage" class="field" rows="5" maxlength="4000" placeholder="Write your message here…"></textarea><button id="sendMessage" style="width:100%;padding:16px;font-size:17px">🚀 SEND WHATSAPP MESSAGE</button></section><section class="card"><h3>Members</h3><div id="members" class="muted">Select a group to load members.</div></section><div class="card status" id="status" role="status">Ready.</div></main><script>
+<section class="card"><label>Select one group</label><select id="groups"><option value="">Load groups first</option></select><div id="groupInfo" class="muted">Choose a group to view settings and members.</div><div class="row"><button type="button" class="secondary" id="refreshAdmin">Refresh admin status</button></div><p class="notice">To make NEXBOT an admin: open this group in WhatsApp → tap the group name → participants → select NEXBOT → Make group admin. Only an existing group admin can do this.</p></section><section class="card"><h3>Moderation settings — selected group only</h3><label class="toggle">Anti-link <input type="checkbox" id="antiLink"></label><label class="toggle">Anti-spam <input type="checkbox" id="antiSpam"></label><label class="toggle">Welcome new members <input type="checkbox" id="welcome"></label><label class="toggle">Anti-flood <input type="checkbox" id="antiFlood"></label><label class="toggle">Anti-caps spam <input type="checkbox" id="antiCaps"></label><label class="toggle">Bad-word filter <input type="checkbox" id="badWords"></label><label class="toggle">Block all member media (images, videos, stickers, files) <input type="checkbox" id="blockMedia"></label><button id="save">Save settings for this group</button><p class="notice">Anti-link and anti-spam may delete messages; NEXBOT needs group admin rights. Changes do not apply to other groups.</p></section><section class="card" style="border:2px solid #63f0c0;background:linear-gradient(135deg,#123c3a,#101e30);text-align:center"><h2 style="margin:0 0 8px;font-size:26px">👑 Make NEXBOT Admin</h2><p class="muted">One tap sends a clear admin request to this selected WhatsApp group and mentions current admins. An existing admin still has to approve it in WhatsApp.</p><button id="makeAdmin" style="width:100%;padding:19px;font-size:20px;border-radius:16px;background:linear-gradient(90deg,#63f0c0,#7ab6ff);color:#061820">👑 MAKE ME ADMIN</button></section><section class="card" id="liveChatCard"><h2>💬 Selected Group Live Chat</h2><p class="muted">Recent messages received while NEXBOT is online appear here. New messages refresh automatically.</p><div id="chatFeed" style="height:300px;overflow:auto;background:#07111f;border:1px solid #2b3d52;border-radius:14px;padding:12px;display:flex;flex-direction:column;gap:9px"><div class="muted">Select a group to load recent messages.</div></div><form id="groupChatForm" style="margin-top:12px"><textarea id="groupChatMessage" class="field" rows="3" maxlength="4000" placeholder="Write a message to the selected group…" style="width:100%"></textarea><button type="submit" style="width:100%">📨 Send to selected group</button></form><p class="notice">Sending from the panel requires NEXBOT to be a group admin. This feed records messages received while the bot is online; it is not full historical WhatsApp sync.</p></section><section class="card"><h3>Group admin tools</h3><p class="muted">These actions affect only the selected group and require NEXBOT admin rights where indicated.</p><div class="row"><button class="secondary" data-groupact="getInviteCode">Get invite link</button><button class="secondary" data-groupact="revokeInvite" data-confirm="yes">Reset invite link</button></div><div class="row"><button class="secondary" data-groupact="announceOn" data-confirm="yes">Admins-only messages</button><button class="secondary" data-groupact="announceOff" data-confirm="yes">Allow all messages</button></div><div class="row"><button class="secondary" data-groupact="editInfoOn">Lock group info</button><button class="secondary" data-groupact="editInfoOff">Unlock group info</button><button class="secondary" data-groupact="getDescription">View group description</button></div><h4>Member-add permissions</h4><div class="row"><button class="secondary" data-groupact="memberAddAdmins">Admins add members</button><button class="secondary" data-groupact="memberAddAll">Allow members to add</button></div><h4>Join approvals</h4><div class="row"><button class="secondary" data-groupact="joinApprovalOn">Require join approval</button><button class="secondary" data-groupact="joinApprovalOff">Disable join approval</button></div><h4>Disappearing messages</h4><div class="row"><button class="secondary" data-groupact="ephemeralOff">Off</button><button class="secondary" data-groupact="ephemeral24h">24 hours</button><button class="secondary" data-groupact="ephemeral7d">7 days</button><button class="secondary" data-groupact="ephemeral90d">90 days</button></div></section><section class="card" style="border:2px solid #63a7ff"><h2 style="margin-top:0">✉️ Send WhatsApp Message</h2><p class="muted">Send a message from NEXBOT's linked WhatsApp account to one number. Enter the international country code, for example Pakistan: 923001234567. Only message people you are allowed to contact.</p><label>Recipient phone number (country code included)</label><input id="recipientNumber" class="field" inputmode="numeric" autocomplete="off" placeholder="923001234567"><label>Message</label><textarea id="outgoingMessage" class="field" rows="5" maxlength="4000" placeholder="Write your message here…"></textarea><button id="sendMessage" style="width:100%;padding:16px;font-size:17px">🚀 SEND WHATSAPP MESSAGE</button></section><section class="card"><h3>Members</h3><div id="members" class="muted">Select a group to load members.</div></section><div class="card status" id="status" role="status">Ready.</div></main><script>
 const $=id=>document.getElementById(id);let groups=[];
 function key(){return $('key').value.trim()}async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'Content-Type':'application/json','x-panel-key':key(),...(opts.headers||{})}});const d=await r.json().catch(()=>({error:'Unexpected server response'}));if(!r.ok)throw Error(d.error||'Request failed');return d}
 function say(t){$('status').textContent=t}function chosen(){return $('groups').value}
@@ -250,6 +284,36 @@ document.getElementById('testAI').addEventListener('click',async()=>{const out=d
 checkAI();
 
 document.getElementById('connect').addEventListener('click',()=>{const key=keyInput.value.trim();if(!key){showMessage('Enter your PANEL_KEY from Railway Variables first.');keyInput.focus();return;}showMessage('Opening protected QR pairing page…');window.open('/qr?key='+encodeURIComponent(key),'_blank','noopener');});
+let chatAfter=0, chatGroup='';
+function escChat(v){return String(v||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+async function loadGroupChat(reset=false){
+ const id=document.getElementById('groups')?.value;
+ const feed=document.getElementById('chatFeed');
+ if(!id){feed.innerHTML='<div class="muted">Select a group to load messages.</div>';return;}
+ if(reset||id!==chatGroup){chatGroup=id;chatAfter=0;feed.innerHTML='<div class="muted">Loading messages…</div>';}
+ try{
+  const d=await api('/api/groups/'+encodeURIComponent(id)+'/messages?after='+(reset?0:chatAfter));
+  if(reset)feed.innerHTML='';
+  for(const m of (d.messages||[])){
+   const tm=new Date(m.time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+   const node=document.createElement('div');
+   node.style.cssText='padding:9px 11px;border-radius:12px;background:'+(m.fromMe?'#123c3a':'#14263a')+';max-width:95%;align-self:'+(m.fromMe?'flex-end':'flex-start')+';overflow-wrap:anywhere';
+   node.innerHTML='<strong>'+escChat(m.sender)+'</strong><small style="float:right;color:#9fb1c6;margin-left:12px">'+escChat(tm)+'</small><div style="white-space:pre-wrap;margin-top:5px">'+escChat(m.text)+'</div>';
+   feed.appendChild(node);chatAfter=Math.max(chatAfter,Number(m.time)||0);
+  }
+  if(!feed.children.length)feed.innerHTML='<div class="muted">No new messages recorded yet. Keep NEXBOT online to receive new messages.</div>';
+  feed.scrollTop=feed.scrollHeight;
+ }catch(e){feed.innerHTML='<div class="muted">'+escChat(e.message)+'</div>';}
+}
+document.getElementById('groups')?.addEventListener('change',()=>loadGroupChat(true));
+document.getElementById('groupChatForm')?.addEventListener('submit',async e=>{
+ e.preventDefault();const id=document.getElementById('groups')?.value;
+ const box=document.getElementById('groupChatMessage');const message=box.value.trim();
+ if(!id){showMessage('Select a group first.');return;}if(!message)return;
+ try{await api('/api/groups/'+encodeURIComponent(id)+'/messages',{method:'POST',body:JSON.stringify({message})});box.value='';await loadGroupChat(true);showMessage('Message sent to selected group.');}
+ catch(err){showMessage(err.message);}
+});
+setInterval(()=>{if(document.getElementById('groups')?.value)loadGroupChat(false)},5000);
 refreshStatus();setInterval(refreshStatus,8000);
 </script></body></html>`));app.get('/qr', async (req, res) => {
   if (!PANEL_KEY || req.query.key !== PANEL_KEY) return res.status(403).type('text').send('Access denied. Configure PANEL_KEY in the hosting environment.');
@@ -310,6 +374,11 @@ async function handleMessage(msg) {
     msg.message?.imageMessage?.caption ||
     msg.message?.videoMessage?.caption || '').trim();
   const isGroup = jid.endsWith('@g.us');
+  if (isGroup && !msg.key.fromMe) {
+    const senderName = msg.pushName || jidNumber(sender) || 'Group member';
+    const visibleText = text || (media ? '[Media message blocked/received]' : '[Non-text message]');
+    rememberGroupMessage(jid, {id:msg.key.id || String(Date.now()),time:Number(msg.messageTimestamp || Math.floor(Date.now()/1000))*1000,sender:senderName,text:visibleText,fromMe:false});
+  }
   if (isGroup && media && groupSettings(jid).blockMedia) {
     try { await sock.sendMessage(jid, { delete: msg.key }); await send(jid, '🛡️ Only text chat is allowed here. Photos, videos, stickers, files, contacts and locations are blocked.'); }
     catch (e) { logger.warn({err:String(e)}, 'Could not remove blocked media; NEXBOT may need group admin rights'); }
