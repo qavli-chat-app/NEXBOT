@@ -316,10 +316,10 @@ async function handleMessage(msg) {
   if (isGroup && groupConfig.aiReplies && !text.startsWith(PREFIX)) {
     const q = text.toLowerCase();
     let answer = '';
-    if (/\\b(hi|hello|salam|assalam|aoa)\\b/.test(q)) answer = '👋 Hello! I am NEXBOT group assistant. Ask a clear question, or send !help for commands.';
-    else if (/\\b(who are you|your name|what are you)\\b/.test(q)) answer = '🤖 I am NEXBOT, this group’s basic free assistant and moderator.';
-    else if (/\\b(admin|moderator|group rules)\\b/.test(q) && /\\?/.test(q)) answer = '🛡️ Please follow this group’s rules. For group-specific decisions, contact a group admin.';
-    else if (/\\b(math|2\\s*\\+\\s*2)\\b/.test(q) && /2\\s*\\+\\s*2/.test(q)) answer = '🧮 2 + 2 = 4';
+    if (['hi','hello','salam','assalam','aoa'].some(word => q === word || q.startsWith(word + ' '))) answer = '👋 Hello! I am NEXBOT group assistant. Ask a clear question, or send !help for commands.';
+    else if (q.includes('who are you') || q.includes('your name')) answer = '🤖 I am NEXBOT, this group’s basic free assistant and moderator.';
+    else if (q.includes('group rules') || q.includes('who is admin')) answer = '🛡️ Please follow this group’s rules. For group-specific decisions, contact a group admin.';
+    else if (q.includes('2+2') || q.includes('2 + 2')) answer = '🧮 2 + 2 = 4';
     if (answer) { try { await send(jid, answer); } catch (e) { logger.warn({err:String(e)}, 'Assistant reply failed'); } }
   }
   if (!text.startsWith(PREFIX)) return;
