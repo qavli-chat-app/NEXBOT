@@ -237,8 +237,7 @@ app.post('/api/groups/:id/action', async (req, res) => {
     }
     if (action === 'memberAddAll' || action === 'memberAddAdmins') {
       await sock.groupMemberAddMode(id, action === 'memberAddAdmins' ? 'admin_add' : 'all_member_add');
-      return res.json({ok:true,message:action === 'memberAddAdmins' ? 'Only admins can add members.' : 'Members can add participants.'});
-    }
+      return res.json({ok:true,message:action === 'memberAddAdmins' ? 'Only admins can add members.' : 'Members can add participants.'});    }
     if (action === 'joinApprovalOn' || action === 'joinApprovalOff') {
       await sock.groupJoinApprovalMode(id, action === 'joinApprovalOn' ? 'on' : 'off');
       return res.json({ok:true,message:action === 'joinApprovalOn' ? 'Join approval enabled.' : 'Join approval disabled.'});
@@ -317,6 +316,8 @@ app.get('/', (_req, res) => res.type('html').send(`<!doctype html>
 <footer class="foot"><span>© NEXBOT PRO · Independent community tool</span><span><a href="https://github.com/qavli-chat-app/NEXBOT" target="_blank" rel="noreferrer">Source code</a> · Keep your session private</span></footer></div>
 <script>
 const statusEl=document.getElementById('status'),msg=document.getElementById('message'),keyInput=document.getElementById('key');
+function key(){return keyInput.value.trim()}
+async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'Content-Type':'application/json','x-panel-key':key(),...(opts.headers||{})}});const d=await r.json().catch(()=>({error:'Unexpected server response'}));if(!r.ok)throw Error(d.error||'Request failed');return d}
 function showMessage(t){msg.textContent=t;msg.classList.add('show')}
 async function refreshStatus(){try{const r=await fetch('/health',{cache:'no-store'});if(!r.ok)throw new Error('Status unavailable');const d=await r.json();const label=d.connected?'WhatsApp connected':d.connectionState==='qr_ready'?'QR ready':d.connectionState==='connecting'?'Connecting…':d.connectionState||'Starting';statusEl.className='status'+(d.connected?' live':'');statusEl.querySelector('span').textContent=label; if(d.connected)showMessage('WhatsApp is connected. You can now test !ping and !help in a chat.');}catch(e){statusEl.className='status';statusEl.querySelector('span').textContent='Status unavailable';}}
 document.getElementById('refresh').addEventListener('click',refreshStatus);
@@ -324,8 +325,6 @@ async function checkAI(){const el=document.getElementById('aiConnectionStatus');
 document.getElementById('connectAI').addEventListener('click',()=>{window.open('https://openrouter.ai/keys','_blank','noopener');showMessage('OpenRouter opened. Add the key only in Railway Variables as OPENROUTER_API_KEY.');});
 document.getElementById('checkAI').addEventListener('click',checkAI);
 document.getElementById('testAI').addEventListener('click',async()=>{const out=document.getElementById('aiTestResult'),prompt=document.getElementById('aiTestPrompt').value.trim();if(!key()){out.textContent='Enter PANEL_KEY at the top first.';return;}if(!prompt){out.textContent='Type a question first.';return;}out.textContent='Testing free AI…';try{const d=await api('/api/ai-test',{method:'POST',body:JSON.stringify({prompt})});out.textContent='AI reply ('+d.model+'):\\n'+d.answer;}catch(e){out.textContent='AI test failed: '+e.message}});
-checkAI();
-
 document.getElementById('connect').addEventListener('click',()=>{const key=keyInput.value.trim();if(!key){showMessage('Enter your PANEL_KEY from Railway Variables first.');keyInput.focus();return;}showMessage('Opening protected QR pairing page…');window.open('/qr?key='+encodeURIComponent(key),'_blank','noopener');});
 let chatAfter=0, chatGroup='';
 function escChat(v){return String(v||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
@@ -477,8 +476,7 @@ async function handleMessage(msg) {
   }
 
   if (isGroup && !senderIsAdmin) {
-    const groupKey = jid + ':' + sender;
-    const now = Date.now();
+    const groupKey = jid + ':' + sender;    const now = Date.now();
     const recent = (recentMessages.get(groupKey) || []).filter(t => now - t < 10000);
     recent.push(now);
     recentMessages.set(groupKey, recent);
@@ -646,10 +644,25 @@ async function startBot() {
         lastDisconnect = String(disconnect?.error?.message || 'connection closed');
         connectionState = 'disconnected';
         logger.warn({ code, lastDisconnect }, 'WhatsApp connection closed');
-        if (code !== DisconnectReason.loggedOut) {
-          clearTimeout(reconnectTimer);
-          reconnectTimer = setTimeout(() => { starting = false; startBot().catch(err => logger.error({ err: String(err) }, 'Restart failed')); }, 3000);
-        } else logger.error('Session logged out. Review WhatsApp Linked Devices and pair again if needed.');
+        clearTimeout(reconnectTimer);
+        if (code === DisconnectReason.loggedOut) {
+          // Preserve the invalid session for diagnosis; start a fresh pairing session.
+          // Keep /data/bot-state.json and the persistent volume untouched.
+          try {
+            const backupDir = AUTH_DIR + '.loggedout-backup-' + Date.now();
+            if (fs.existsSync(AUTH_DIR)) fs.renameSync(AUTH_DIR, backupDir);
+            fs.mkdirSync(AUTH_DIR, { recursive: true });
+            latestQR = '';
+            connectionState = 're-pair-required';
+            logger.warn({ backupDir }, 'Logged-out WhatsApp credentials backed up; a fresh QR will be generated');
+          } catch (e) {
+            logger.error({ err: String(e) }, 'Could not prepare fresh pairing; check /data volume permissions');
+          }
+        }
+        reconnectTimer = setTimeout(() => {
+          starting = false;
+          startBot().catch(err => logger.error({ err: String(err) }, 'Restart failed'));
+        }, 2500);
       }
     });
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
