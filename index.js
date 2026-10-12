@@ -372,7 +372,7 @@ async function handleMessage(msg) {
       }
     }
   }
-  if (isGroup && groupConfig.aiReplies && !text.startsWith(PREFIX)) {
+  if (groupConfig.aiReplies && !text.startsWith(PREFIX)) {
     const q = text.toLowerCase();
     let answer = '';
     if (['hi','hello','salam','assalam','aoa'].some(word => q === word || q.startsWith(word + ' '))) answer = '👋 Hello! I am NEXBOT group assistant. Ask a clear question, or send !help for commands.';
