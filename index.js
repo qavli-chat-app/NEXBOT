@@ -397,7 +397,7 @@ async function handleMessage(msg) {
       'earn money', 'marketing', 'promotion', 'contact me', 'dm me', 'inbox me',
       'whatsapp me', 'call me', 'deal', 'discount', 'shop now'
     ];
-    const phoneLike = /(?:^|\\D)(?:\\+?\\d[\\s().-]*){9,15}(?:$|\\D)/.test(text);
+    const phoneLike = /(?:^|\D)(?:\+?\d[\s().-]*){9,15}(?:$|\D)/.test(text);
     const businessLike = blockedTerms.some(term => lowerText.includes(term));
     if ((groupConfig.badWords && blockedTerms.some(term => lowerText.includes(term))) || phoneLike || businessLike) {
       try { await sock.sendMessage(jid, { delete: msg.key }); await send(jid, '🛡️ Group rule: only normal text chat is allowed. Links, phone numbers, adult/sexual words and business promotions are not allowed.'); }
@@ -490,7 +490,9 @@ async function handleMessage(msg) {
     case 'groupinfo': {
       if (!isGroup) return send(jid, 'This command works in groups.');
       const meta = await sock.groupMetadata(jid);
-      return send(jid, `👥 ${meta.subject}\nMembers: ${meta.participants.length}\nAnti-link: ${settings.antiLink ? 'ON' : 'OFF'}\nAnti-spam: ${settings.antiSpam ? 'ON' : 'OFF'}\nWelcome: ${settings.welcome ? 'ON' : 'OFF'}`);
+      const cfg = groupSettings(jid);
+      const botAdmin = meta.participants.some(p => jidNumber(p.id) === jidNumber(sock.user?.id) && ['admin','superadmin'].includes(p.admin));
+      return send(jid, `👥 ${meta.subject}\nMembers: ${meta.participants.length}\nBot admin: ${botAdmin ? 'YES' : 'NO'}\nAnti-link: ${cfg.antiLink ? 'ON' : 'OFF'}\nAnti-spam: ${cfg.antiSpam ? 'ON' : 'OFF'}\nWelcome: ${cfg.welcome ? 'ON' : 'OFF'}`);
     }
     case 'tagall': {
       if (!isGroup) return send(jid, 'This command works in groups.');
