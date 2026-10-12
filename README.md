@@ -8,6 +8,8 @@ NEXBOT is a separate project from QAVLI. It is a self-hosted WhatsApp group mode
 - Welcome messages when members join
 - Anti-link moderation and basic burst anti-spam
 - Commands: `!help`, `!ping`, `!groupinfo`, `!tagall [message]`, `!kick @member`, `!warn @member`, `!warnings @member`, `!clearwarn @member`, `!antilink on|off`, `!antispam on|off`, `!welcome on|off`
+- Private-message protection with the exact auto-reply: `I am not accepting private messages. Please do not message me.` (enabled by default; one reply per sender per 24 hours)
+- Protected panel APIs to check/toggle private-message protection: `GET /api/private-protection` and `PATCH /api/private-protection` with `{ "enabled": true|false }`
 - Persistent WhatsApp auth and saved warning/settings state when `DATA_DIR` points to a persistent volume
 - Automatic reconnect after temporary connection drops
 
