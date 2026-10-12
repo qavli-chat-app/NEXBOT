@@ -222,7 +222,11 @@ async function startBot() {
             }
             if (await moderateLink(msg, jid, meta)) continue;
             const bad = settings.blockedWords[jid] || [];
-            if (text && bad.some(w => w && new RegExp('(^|[^\\p{L}\\p{N}])' + w.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\if (await moderateLink(msg, jid, meta)) continue;') + '([^\\p{L}\\p{N}]|$)', 'iu').test(text)) && !isAdmin(meta, sender)) {
+            if (text && bad.some(w => w && text.toLowerCase().includes(w.toLowerCase())) && !isAdmin(meta, sender)) {
+              if (isAdmin(meta, sock.user?.id?.split(':')[0] + '@s.whatsapp.net')) await sock.sendMessage(jid, { delete: msg.key }).catch(() => {});
+              await sendText(jid, '⚠️ Please keep the group respectful and follow its rules.', msg);
+              continue;
+            }
               if (isAdmin(meta, sock.user?.id?.split(':')[0] + '@s.whatsapp.net')) await sock.sendMessage(jid, { delete: msg.key }).catch(() => {});
               await sendText(jid, '⚠️ Please keep the group respectful and follow its rules.', msg);
               continue;
