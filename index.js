@@ -17,692 +17,173 @@ const PREFIX = process.env.COMMAND_PREFIX || '!';
 const OWNER = (process.env.BOT_OWNER || '').replace(/\D/g, '');
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 fs.mkdirSync(AUTH_DIR, { recursive: true });
+app.disable('x-powered-by');
+app.use(express.json({ limit: '100kb' }));
 
-let sock;
-let latestQR = '';
-let connected = false;
-let connectionState = 'starting';
-let lastDisconnect = null;
-let reconnectTimer;
-let starting = false;
-const warnings = new Map();
-const recentMessages = new Map();
-const defaults = { antiLink: true, antiSpam: true, welcome: true, antiFlood: true, antiCaps: false, badWords: true, blockMedia: true, aiReplies: false, privateMessageProtection: true };
-const PRIVATE_REPLY = 'I am not accepting private messages. Please do not message me.';
-const privateReplyCooldown = new Map();
-let settings = { ...defaults, groups: {} };
-
+let sock = null, latestQR = '', connected = false, connectionState = 'starting';
+let lastDisconnect = null, starting = false, reconnectTimer = null, startedAt = Date.now();
+let settings = { antiLink: true, antiSpam: true, welcome: true, groups: {} };
+let messageCount = 0, commandCount = 0, lastMessageAt = null;
 try {
   if (fs.existsSync(STATE_FILE)) {
-    const saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    settings = { ...defaults, ...(saved.settings || {}), groups: saved.settings?.groups || {} };
-    for (const [key, value] of Object.entries(saved.warnings || {})) warnings.set(key, Number(value) || 0);
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {} };
   }
-} catch (e) { logger.warn({ err: String(e) }, 'Saved state could not be read; using defaults'); }
-
+} catch (e) { logger.warn({ err: String(e) }, 'Could not load saved settings'); }
 function saveState() {
-  try {
-    const tmp = STATE_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify({ settings, warnings: Object.fromEntries(warnings) }), { mode: 0o600 });
-    fs.renameSync(tmp, STATE_FILE);
-  } catch (e) { logger.error({ err: String(e) }, 'Could not persist bot state; verify DATA_DIR volume permissions'); }
+  try { const tmp = STATE_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify({ settings }, null, 2)); fs.renameSync(tmp, STATE_FILE); }
+  catch (e) { logger.error({ err: String(e) }, 'Could not save state'); }
 }
-
-
-function panelAuthorized(req) {
-  return Boolean(PANEL_KEY) && (req.get('x-panel-key') === PANEL_KEY || req.query.key === PANEL_KEY);
+function auth(req, res, next) {
+  if (!PANEL_KEY) return res.status(503).json({ error: 'PANEL_KEY is not configured. Set it in Railway Variables.' });
+  const provided = req.get('x-panel-key') || req.query.key || req.body?.key;
+  if (typeof provided !== 'string' || provided.length !== PANEL_KEY.length || !cryptoSafeEqual(provided, PANEL_KEY))
+    return res.status(401).json({ error: 'Unauthorized' });
+  next();
 }
-function groupSettings(jid) { return { ...defaults, ...(settings.groups?.[jid] || {}) }; }
-app.use(express.json({ limit: '32kb' }));
-app.get('/api/private-protection', (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
-  res.set('Cache-Control', 'no-store');
-  res.json({ enabled: settings.privateMessageProtection !== false, reply: PRIVATE_REPLY });
-});
-app.patch('/api/private-protection', (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
-  if (typeof req.body?.enabled !== 'boolean') return res.status(400).json({ error: 'enabled must be true or false' });
-  settings.privateMessageProtection = req.body.enabled;
-  saveState();
-  res.json({ ok: true, enabled: settings.privateMessageProtection, reply: PRIVATE_REPLY });
-});
-app.get('/api/ai-status', (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
-  res.set('Cache-Control', 'no-store');
-  res.json({ configured: Boolean(OPENROUTER_API_KEY), provider: 'OpenRouter', model: OPENROUTER_MODEL, mode: OPENROUTER_API_KEY ? 'ai-ready' : 'fallback-only', note: OPENROUTER_API_KEY ? 'OpenRouter key is configured; free-model limits and availability apply.' : 'OPENROUTER_API_KEY is not configured. Existing local fallback remains active.' });
-});
-app.post('/api/ai-test', async (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key. Enter it at the top of the dashboard.' });
-  const prompt = String(req.body?.prompt || '').trim();
-  if (!prompt || prompt.length > 1000) return res.status(400).json({ error: 'Enter a test prompt up to 1000 characters.' });
-  if (!OPENROUTER_API_KEY) return res.status(503).json({ error: 'OPENROUTER_API_KEY is missing in Railway Variables.' });
-  const answer = await freeModelReply(prompt);
-  if (!answer) return res.status(502).json({ error: 'AI did not reply. The free model may be busy; check Railway deploy logs.' });
-  return res.json({ ok: true, model: OPENROUTER_MODEL, answer });
-});
-app.post('/api/settings/reset', (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
-  if (req.body?.confirm !== 'RESET_SETTINGS_ONLY') return res.status(400).json({ error: 'Explicit settings-reset confirmation is required.' });
-  settings = { ...defaults, groups: {} };
-  warnings.clear();
-  saveState();
-  logger.info('Dashboard settings reset; WhatsApp auth session and /data/auth were preserved');
-  res.set('Cache-Control', 'no-store');
-  return res.json({ ok: true, message: 'Bot settings reset to defaults. WhatsApp login/session was preserved.' });
-});
-app.get('/api/groups', async (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
-  if (!connected || !sock) return res.status(503).json({ error: 'WhatsApp is not connected yet. Check /health first.' });
-  try {
-    const groups = await sock.groupFetchAllParticipating();
-    res.set('Cache-Control', 'no-store');
-    res.json({ groups: Object.values(groups).map(g => ({
-      id: g.id, subject: g.subject || 'Unnamed group',
-      size: g.participants?.length || 0,
-      botIsAdmin: Boolean(g.participants?.some(p => jidNumber(p.id) === jidNumber(sock.user?.id) && ['admin','superadmin'].includes(p.admin))),
-      settings: groupSettings(g.id)
-    })).sort((a,b) => a.subject.localeCompare(b.subject)) });
-  } catch (e) { logger.error({err:String(e)}, 'Could not fetch groups'); res.status(500).json({error:'Could not load groups from WhatsApp.'}); }
-});
-app.get('/api/groups/:id', async (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
-  if (!connected || !sock) return res.status(503).json({ error: 'WhatsApp is not connected.' });
-  const id = String(req.params.id);
-  if (!id.endsWith('@g.us')) return res.status(400).json({error:'Invalid group id'});
-  try {
-    const meta = await sock.groupMetadata(id);
-    res.json({ id, subject: meta.subject, size: meta.participants.length,
-      botIsAdmin: Boolean(meta.participants.some(p => jidNumber(p.id) === jidNumber(sock.user?.id) && ['admin','superadmin'].includes(p.admin))),
-      settings: groupSettings(id),
-      participants: meta.participants.map(p => ({id:p.id, name:p.name || p.notify || jidNumber(p.id), admin:p.admin || ''}))
-    });
-  } catch { res.status(404).json({error:'Group not found or bot is not a member.'}); }
-});
-const groupMessageStore = new Map();
-function rememberGroupMessage(jid, item) {
-  if (!jid?.endsWith('@g.us')) return;
-  const list = groupMessageStore.get(jid) || [];
-  list.push(item);
-  if (list.length > 250) list.splice(0, list.length - 250);
-  groupMessageStore.set(jid, list);
+function cryptoSafeEqual(a,b) {
+  const { timingSafeEqual } = requireCrypto;
+  const aa = Buffer.from(a), bb = Buffer.from(b);
+  return aa.length === bb.length && timingSafeEqual(aa, bb);
 }
-app.get('/api/groups/:id/messages', async (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({error:'Unauthorized panel key'});
-  if (!connected || !sock) return res.status(503).json({error:'WhatsApp is not connected.'});
-  const id = String(req.params.id);
-  if (!id.endsWith('@g.us')) return res.status(400).json({error:'Invalid group id'});
-  try { await sock.groupMetadata(id); } catch { return res.status(404).json({error:'Group not found or bot is not a member.'}); }
-  const after = Number(req.query.after || 0);
-  res.set('Cache-Control','no-store');
-  res.json({messages:(groupMessageStore.get(id)||[]).filter(m=>m.time>after).slice(-100)});
+import { timingSafeEqual as timingEqual } from 'node:crypto';
+const requireCrypto = { timingSafeEqual: timingEqual };
+const esc = (s='') => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+app.get('/health', (_req,res) => res.json({ ok:true, service:'NEXBOT Pro', state:connectionState, connected, uptimeSeconds:Math.floor((Date.now()-startedAt)/1000), messageCount, commandCount, lastMessageAt, lastDisconnect }));
+app.get('/api/status', auth, (_req,res) => res.json({ service:'NEXBOT Pro', state:connectionState, connected, qrAvailable:!!latestQR, uptimeSeconds:Math.floor((Date.now()-startedAt)/1000), messageCount, commandCount, lastMessageAt, lastDisconnect, settings }));
+app.get('/api/qr', auth, async (_req,res) => {
+  if (connected) return res.json({ connected:true, message:'WhatsApp is already connected.' });
+  if (!latestQR) return res.status(404).json({ connected:false, state:connectionState, message:'QR not available yet. Refresh shortly and check runtime logs.' });
+  try { res.json({ connected:false, qr: await QRCode.toDataURL(latestQR), state:connectionState }); }
+  catch { res.status(500).json({ error:'QR generation failed' }); }
 });
-app.post('/api/groups/:id/messages', async (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({error:'Unauthorized panel key'});
-  if (!connected || !sock) return res.status(503).json({error:'WhatsApp is not connected.'});
-  const id = String(req.params.id), message = String(req.body?.message || '').trim();
-  if (!id.endsWith('@g.us')) return res.status(400).json({error:'Invalid group id'});
-  if (!message || message.length > 4000) return res.status(400).json({error:'Message must be 1–4000 characters.'});
-  try {
-    const meta = await sock.groupMetadata(id);
-    const bot = meta.participants.find(p => jidNumber(p.id) === jidNumber(sock.user?.id));
-    if (!bot || !['admin','superadmin'].includes(bot.admin)) return res.status(403).json({error:'Make NEXBOT a group admin first to send from this control panel.'});
-    await sock.sendMessage(id,{text:message});
-    const item={id:'panel-'+Date.now(),time:Date.now(),sender:'NEXBOT · Control Panel',text:message,fromMe:true};
-    rememberGroupMessage(id,item);
-    return res.json({ok:true,message:'Message sent to selected group.',item});
-  } catch(e) { logger.warn({err:String(e)},'Panel group message failed'); return res.status(500).json({error:'Could not send group message. Check NEXBOT admin permission.'}); }
+app.post('/api/settings', auth, (req,res) => {
+  const allowed = ['antiLink','antiSpam','welcome'];
+  for (const key of allowed) if (typeof req.body?.[key] === 'boolean') settings[key] = req.body[key];
+  saveState(); res.json({ ok:true, settings });
 });
-app.post('/api/send-message', async (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
-  if (!connected || !sock) return res.status(503).json({ error: 'WhatsApp is not connected.' });
-  const number = String(req.body?.number || '').replace(/[^0-9]/g, '');
-  const message = String(req.body?.message || '').trim();
-  if (number.length < 8 || number.length > 15) return res.status(400).json({error:'Enter a valid international phone number including country code, digits only.'});
-  if (!message || message.length > 4000) return res.status(400).json({error:'Message must be between 1 and 4000 characters.'});
-  try {
-    const jid = number + '@s.whatsapp.net';
-    const result = await sock.onWhatsApp(jid);
-    if (!result?.some(x => x.exists)) return res.status(404).json({error:'This number does not appear to have a WhatsApp account.'});
-    await sock.sendMessage(jid, { text: message });
-    return res.json({ok:true,message:'WhatsApp message sent to +' + number + '.'});
-  } catch (e) {
-    logger.warn({err:String(e)}, 'Manual dashboard message failed');
-    return res.status(500).json({error:'Could not send message. Check WhatsApp connection and try again.'});
-  }
-});
+app.get('/dashboard', (_req,res) => res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>NEXBOT Pro</title><style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0b1020;color:#eef2ff;font:16px system-ui}main{max-width:900px;margin:auto;padding:24px}.hero{padding:24px;border:1px solid #26314d;border-radius:22px;background:linear-gradient(135deg,#171f3c,#10172a)}h1{margin:0;font-size:32px}p{color:#aab6d3}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:18px}.card{padding:18px;border-radius:16px;background:#121a2e;border:1px solid #26314d}input,button{font:inherit;padding:12px;border-radius:10px;border:1px solid #34415f;background:#0b1020;color:#fff;width:100%;margin-top:8px}button{cursor:pointer;background:#536dfe;border:0;font-weight:700}.muted{font-size:13px;color:#8f9bb8}pre{white-space:pre-wrap;word-break:break-word;color:#b6c5e6}</style></head><body><main><section class="hero"><h1>⚡ NEXBOT Pro</h1><p>WhatsApp group moderation · Commands · Connection health</p><div id="status">Enter your private panel key to load status.</div></section><section class="grid"><div class="card"><h3>Secure dashboard</h3><label>Panel key</label><input id="key" type="password" autocomplete="off" placeholder="Railway PANEL_KEY"><button onclick="loadStatus()">Connect dashboard</button><p class="muted">The key is used only for requests in this page; never share it.</p></div><div class="card"><h3>WhatsApp pairing</h3><button onclick="loadQR()">Show QR status</button><div id="qr"></div></div><div class="card"><h3>Bot controls</h3><label><input id="antiLink" type="checkbox" style="width:auto"> Anti-link</label><label><input id="antiSpam" type="checkbox" style="width:auto"> Anti-spam</label><label><input id="welcome" type="checkbox" style="width:auto"> Welcome messages</label><button onclick="saveSettings()">Save settings</button></div><div class="card"><h3>Commands</h3><pre>!help !ping !menu
+!rules !admins !groupinfo
+!kick @user (admin)
+!promote @user (admin)
+!demote @user (admin)
+!tagall (admin)
+!antilink on|off (admin)
+!antispam on|off (admin)</pre></div></section><p class="muted">Health endpoint: /health · Prefix: ${esc(PREFIX)} · Do not expose panel key.</p></main><script>
+let key='';function headers(){return {'Content-Type':'application/json','x-panel-key':key}}async function loadStatus(){key=document.getElementById('key').value;try{let r=await fetch('/api/status',{headers:headers()});let d=await r.json();if(!r.ok)throw Error(d.error||'Request failed');document.getElementById('status').innerHTML='<b>State:</b> '+d.state+' · <b>Connected:</b> '+d.connected+'<br><b>Messages:</b> '+d.messageCount+' · <b>Commands:</b> '+d.commandCount+' · <b>Uptime:</b> '+d.uptimeSeconds+'s';for(let k of ['antiLink','antiSpam','welcome'])document.getElementById(k).checked=!!d.settings[k];}catch(e){document.getElementById('status').textContent=e.message}}
+async function loadQR(){if(!key)key=document.getElementById('key').value;let el=document.getElementById('qr');try{let r=await fetch('/api/qr',{headers:headers()});let d=await r.json();if(d.qr)el.innerHTML='<img alt="WhatsApp pairing QR" style="width:100%;max-width:260px;background:white;padding:8px;border-radius:10px" src="'+d.qr+'">';else el.textContent=d.message||'Connected or waiting for QR';}catch(e){el.textContent=e.message}}
+async function saveSettings(){try{let b={};for(let k of ['antiLink','antiSpam','welcome'])b[k]=document.getElementById(k).checked;let r=await fetch('/api/settings',{method:'POST',headers:headers(),body:JSON.stringify(b)});let d=await r.json();if(!r.ok)throw Error(d.error);alert('Settings saved');}catch(e){alert(e.message)}}</script></body></html>`));
 
-app.patch('/api/groups/:id/settings', async (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
-  if (!connected || !sock) return res.status(503).json({ error: 'WhatsApp is not connected.' });
-  const id = String(req.params.id);
-  if (!id.endsWith('@g.us')) return res.status(400).json({error:'Invalid group id'});
-  const allowed = ['antiLink','antiSpam','welcome','antiFlood','antiCaps','badWords','blockMedia'];
-  const patch = req.body || {};
-  if (!Object.keys(patch).length || Object.keys(patch).some(k => !allowed.includes(k) || typeof patch[k] !== 'boolean')) return res.status(400).json({error:'Only supported boolean moderation settings are allowed.'});
-  try { await sock.groupMetadata(id); } catch { return res.status(404).json({error:'Group not found or bot is not a member.'}); }
-  settings.groups ||= {};
-  settings.groups[id] = { ...groupSettings(id), ...patch };
-  saveState();
-  res.json({ok:true, id, settings:groupSettings(id)});
-});
-app.post('/api/groups/bulk-settings', async (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
-  if (!connected || !sock) return res.status(503).json({ error: 'WhatsApp is not connected.' });
-  const ids = Array.isArray(req.body?.groupIds) ? [...new Set(req.body.groupIds)] : [];
-  const patch = req.body?.settings;
-  const allowed = ['antiLink','antiSpam','antiFlood','welcome','badWords','blockMedia'];
-  if (!ids.length || ids.length > 100 || ids.some(id => typeof id !== 'string' || !id.endsWith('@g.us'))) return res.status(400).json({error:'Select between 1 and 100 valid groups.'});
-  if (!patch || !Object.keys(patch).length || Object.keys(patch).some(k => !allowed.includes(k) || typeof patch[k] !== 'boolean')) return res.status(400).json({error:'Choose at least one supported setting.'});
-  const results = [];
-  settings.groups ||= {};
-  for (const id of ids) {
-    try {
-      const meta = await sock.groupMetadata(id);
-      settings.groups[id] = { ...groupSettings(id), ...patch };
-      results.push({id, subject:meta.subject || id, ok:true, botIsAdmin:Boolean(meta.participants.some(p => jidNumber(p.id) === jidNumber(sock.user?.id) && ['admin','superadmin'].includes(p.admin)))});
-    } catch {
-      results.push({id, subject:id, ok:false, error:'Could not access group metadata.'});
-    }
-  }
-  saveState();
-  return res.json({ok:results.some(r=>r.ok), applied:Object.keys(patch), results, message:'Settings saved per accessible group. Message deletion and member actions still require NEXBOT to be a group admin.'});
-});
-app.post('/api/groups/:id/action', async (req, res) => {
-  if (!panelAuthorized(req)) return res.status(403).json({ error: 'Unauthorized panel key' });
-  if (!connected || !sock) return res.status(503).json({ error: 'WhatsApp is not connected.' });
-  const id = String(req.params.id), { action, participant } = req.body || {};
-  if (!id.endsWith('@g.us')) return res.status(400).json({error:'Invalid group id'});
-  const memberActions = ['warn','kick','promote','demote'];
-  const groupActions = ['requestAdmin','getInviteCode','revokeInvite','announceOn','announceOff','editInfoOn','editInfoOff','getDescription','memberAddAll','memberAddAdmins','joinApprovalOn','joinApprovalOff','ephemeralOff','ephemeral24h','ephemeral7d','ephemeral90d'];
-  if (memberActions.includes(action) && (typeof participant !== 'string' || !participant.includes('@'))) return res.status(400).json({error:'Choose a valid member and action.'});
-  if (!memberActions.includes(action) && !groupActions.includes(action)) return res.status(400).json({error:'Unsupported action.'});
-  try {
-    const meta = await sock.groupMetadata(id);
-    const bot = meta.participants.find(p => jidNumber(p.id) === jidNumber(sock.user?.id));
-    const botAdmin = Boolean(bot && ['admin','superadmin'].includes(bot.admin));
-    if (action === 'requestAdmin') {
-      const admins = meta.participants.filter(p => ['admin','superadmin'].includes(p.admin) && jidNumber(p.id) !== jidNumber(sock.user?.id));
-      const mentions = admins.map(p => p.id);
-      const suffix = mentions.length ? '\\nRequesting group admins: ' + mentions.map(j => '@' + jidNumber(j)).join(' ') : '';
-      await sock.sendMessage(id, { text: '🛡️ *NEXBOT ADMIN REQUEST*\\nPlease make NEXBOT a group admin so its moderation and group-management tools can work properly.\\n\\nAn existing group admin must approve this request.' + suffix, mentions });
-      return res.json({ok:true,message:'Admin request posted in the selected group. An existing admin must promote NEXBOT manually.'});
-    }
-    if (['kick','promote','demote','announceOn','announceOff','editInfoOn','editInfoOff','revokeInvite','memberAddAll','memberAddAdmins','joinApprovalOn','joinApprovalOff','ephemeralOff','ephemeral24h','ephemeral7d','ephemeral90d'].includes(action) && !botAdmin) return res.status(403).json({error:'Promote NEXBOT to group admin first.'});
-    if (action === 'getDescription') return res.json({ok:true,message:'Group description: '+(meta.desc || '(no description set)')});
-    if (action === 'getInviteCode') {
-      const code = await sock.groupInviteCode(id);
-      return res.json({ok:true,message:'Invite link: https://chat.whatsapp.com/'+code});
-    }
-    if (action === 'revokeInvite') {
-      const code = await sock.groupRevokeInvite(id);
-      return res.json({ok:true,message:'Invite link reset. New link: https://chat.whatsapp.com/'+code});
-    }
-    if (action === 'announceOn' || action === 'announceOff') {
-      await sock.groupSettingUpdate(id, action === 'announceOn' ? 'announcement' : 'not_announcement');
-      return res.json({ok:true,message:action === 'announceOn' ? 'Only admins can send messages now.' : 'All members can send messages now.'});
-    }
-    if (action === 'editInfoOn' || action === 'editInfoOff') {
-      await sock.groupSettingUpdate(id, action === 'editInfoOn' ? 'locked' : 'unlocked');
-      return res.json({ok:true,message:action === 'editInfoOn' ? 'Only admins can edit group info.' : 'Group info editing is open to members.'});
-    }
-    if (action === 'memberAddAll' || action === 'memberAddAdmins') {
-      await sock.groupMemberAddMode(id, action === 'memberAddAdmins' ? 'admin_add' : 'all_member_add');
-      return res.json({ok:true,message:action === 'memberAddAdmins' ? 'Only admins can add members.' : 'Members can add participants.'});    }
-    if (action === 'joinApprovalOn' || action === 'joinApprovalOff') {
-      await sock.groupJoinApprovalMode(id, action === 'joinApprovalOn' ? 'on' : 'off');
-      return res.json({ok:true,message:action === 'joinApprovalOn' ? 'Join approval enabled.' : 'Join approval disabled.'});
-    }
-    if (action.startsWith('ephemeral')) {
-      const durations = {ephemeralOff:0,ephemeral24h:86400,ephemeral7d:604800,ephemeral90d:7776000};
-      await sock.groupToggleEphemeral(id, durations[action]);
-      return res.json({ok:true,message:action === 'ephemeralOff' ? 'Disappearing messages turned off.' : 'Disappearing messages set to '+action.replace('ephemeral','').replace('h',' hours').replace('d',' days')+'.'});
-    }
-    if (!meta.participants.some(p => jidNumber(p.id) === jidNumber(participant))) return res.status(404).json({error:'Member is not in this group.'});
-    if (action === 'kick') {
-      await sock.groupParticipantsUpdate(id, [participant], 'remove');
-      return res.json({ok:true, message:'Removal request sent.'});
-    }
-    if (action === 'promote' || action === 'demote') {
-      await sock.groupParticipantsUpdate(id, [participant], action);
-      return res.json({ok:true,message:action === 'promote' ? 'Admin promotion requested.' : 'Admin demotion requested.'});
-    }
-    const key = id + ':' + participant, count = warnings.get(key) || 0;
-    warnings.set(key, count + 1); saveState();
-    await sock.sendMessage(id,{text:`⚠️ Warning ${count+1} for @${jidNumber(participant)}. Please follow group rules.`,mentions:[participant]});
-    return res.json({ok:true,message:`Warning ${count+1} sent.`});
-  } catch (e) { res.status(500).json({error:'Action failed. Check bot permissions and Railway logs.'}); }
-});
-
-
-app.get('/dashboard', (_req, res) => res.set('Cache-Control', 'no-store, max-age=0').type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NEXBOT Group Control</title><style>
-:root{color-scheme:dark;--bg:#07111f;--card:#101e30;--line:#2b3d52;--mint:#63f0c0;--muted:#9fb1c6}*{box-sizing:border-box}body{margin:0;padding:20px;background:var(--bg);color:#eef6ff;font:15px system-ui}.wrap{max-width:900px;margin:auto}h1{margin:0;font-size:26px}p,.muted{color:var(--muted)}.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;margin:15px 0}.field,button,select{font:inherit;border-radius:10px;padding:12px;border:1px solid var(--line);background:#091524;color:#fff}input,select{width:100%;margin:7px 0 12px}button{cursor:pointer;background:var(--mint);color:#061820;font-weight:750;border:0;margin:4px 4px 4px 0}.secondary{background:#21344a;color:white;border:1px solid var(--line)}.row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1;min-width:180px}.toggle{display:flex;justify-content:space-between;align-items:center;border:1px solid var(--line);padding:12px;border-radius:12px;margin:9px 0}.toggle input{width:auto;margin:0}.member{display:flex;justify-content:space-between;gap:12px;align-items:center;border-bottom:1px solid var(--line);padding:10px 0}.member small{display:block;color:var(--muted);overflow-wrap:anywhere}.notice{font-size:12px;color:#f4d89b}.status{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--mint)}</style></head><body><main class="wrap"><h1>🛡️ NEXBOT Group Control</h1><p>Manage one selected group on your existing linked WhatsApp session.</p><section class="card"><label>Private PANEL_KEY</label><input id="key" class="field" type="password" autocomplete="off" placeholder="Enter Railway PANEL_KEY"><div class="row"><button id="load">Load my WhatsApp groups</button><a href="/health" style="align-self:center;color:var(--mint)">Connection health ↗</a></div><p class="muted">Your key is saved on this device so you normally enter it only once. Do not share it.</p><div class="row"><button type="button" class="secondary" id="checkPanel">Check panel &amp; WhatsApp status</button><button type="button" class="secondary" id="resetSettings">↻ Reset bot settings only</button></div><div id="panelStatus" class="notice" role="status">Enter your PANEL_KEY, then check status or load groups.</div></section>
-<section class="card" id="aiAssistantCard" hidden style="border:1px solid #477fc4;background:linear-gradient(135deg,#132b49,#101e30)">
-<div class="cardhead"><div><h2 style="margin:0">🤖 NEXBOT AI Assistant</h2><div class="sub">OpenRouter Free AI · optional smart replies</div></div><span class="pill">AI</span></div>
-<p class="muted">Use OpenRouter to power NEXBOT's AI replies. Your API key must stay private in Railway Variables as <code>OPENROUTER_API_KEY</code>. Do not paste it into this dashboard or chat. Free models can have usage limits or temporary availability issues.</p>
-<div id="aiConnectionStatus" class="notice" role="status">Enter PANEL_KEY above, then check AI status.</div>
-<div class="row"><button type="button" id="connectAI" style="flex:1;background:linear-gradient(90deg,#63f0c0,#7ab6ff);color:#061820">✨ OpenRouter AI Setup</button><button type="button" class="secondary" id="checkAI">Check AI status</button></div>
-<label for="aiTestPrompt">Test AI reply</label><textarea id="aiTestPrompt" class="field" rows="2" maxlength="1000" placeholder="Ask a simple question to test the assistant"></textarea><button type="button" id="testAI">🧪 Test assistant now</button><div id="aiTestResult" class="status" role="status"></div>
-<p class="notice">To enable replies, select a group below and turn on “Basic free assistant replies”. Keep any paid credits or upgrades disabled if you want to use only free models.</p>
-</section>
-<section class="card"><label>Select one group</label><select id="groups"><option value="">Load groups first</option></select><div id="groupInfo" class="muted">Choose a group to view settings and members.</div><div class="row"><button type="button" class="secondary" id="refreshAdmin">Refresh admin status</button></div><p class="notice">To make NEXBOT an admin: open this group in WhatsApp → tap the group name → participants → select NEXBOT → Make group admin. Only an existing group admin can do this.</p></section><section class="card" id="bulkControlCard"><h3>⚡ Bulk Control — selected groups</h3><p class="muted">Choose multiple groups and apply only the settings you tick below. This saves settings separately for each accessible group.</p><div class="row"><button type="button" class="secondary" id="selectAllGroups">Select all groups</button><button type="button" class="secondary" id="clearGroupSelection">Clear selection</button></div><div id="bulkGroups" style="max-height:260px;overflow:auto;margin:10px 0"><span class="muted">Load groups first.</span></div><div class="muted" id="bulkCount">0 groups selected</div><div class="row"><label class="toggle">Anti-link <input type="checkbox" id="bulkAntiLink"></label><label class="toggle">Anti-spam <input type="checkbox" id="bulkAntiSpam"></label></div><div class="row"><label class="toggle">Anti-flood <input type="checkbox" id="bulkAntiFlood"></label><label class="toggle">Welcome <input type="checkbox" id="bulkWelcome"></label></div><div class="row"><label class="toggle">Bad-word filter <input type="checkbox" id="bulkBadWords"></label><label class="toggle">Block media <input type="checkbox" id="bulkBlockMedia"></label></div><div class="row"><button type="button" id="applyBulk">Enable checked settings</button><button type="button" class="secondary" id="disableBulk">Disable checked settings</button></div><div id="bulkResult" class="status" role="status"></div><p class="notice">Tick a setting to change it; unticked settings are left unchanged. NEXBOT needs group-admin rights to delete messages or enforce moderation.</p></section><section class="card" id="privateProtectionCard" style="border:1px solid #477fc4;background:linear-gradient(135deg,#132b49,#101e30)"><h3>🔒 Private Message Protection</h3><p class="muted">Automatically send this exact reply to people who DM the linked WhatsApp account. It replies at most once per sender every 24 hours.</p><blockquote style="border-left:3px solid #63f0c0;padding:10px 14px;margin:12px 0;background:#0b1727;border-radius:8px">I am not accepting private messages. Please do not message me.</blockquote><label class="toggle">Auto-reply to private messages <input type="checkbox" id="privateProtectionToggle" checked></label><button class="secondary" id="refreshPrivateProtection">Refresh protection status</button><button id="savePrivateProtection">Save private-message setting</button><div class="status" id="privateProtectionStatus" role="status">Enter PANEL_KEY and load status.</div><p class="notice">This sends an automatic reply; it cannot stop someone from sending a DM. Use WhatsApp privacy/block settings if you need to restrict who can message you.</p></section><section class="card"><h3>Moderation settings — selected group only</h3><label class="toggle">Anti-link <input type="checkbox" id="antiLink"></label><label class="toggle">Anti-spam <input type="checkbox" id="antiSpam"></label><label class="toggle">Welcome new members <input type="checkbox" id="welcome"></label><label class="toggle">Anti-flood <input type="checkbox" id="antiFlood"></label><label class="toggle">Anti-caps spam <input type="checkbox" id="antiCaps"></label><label class="toggle">Bad-word filter <input type="checkbox" id="badWords"></label><label class="toggle">Block all member media (images, videos, stickers, files) <input type="checkbox" id="blockMedia"></label><button id="save">Save settings for this group</button><p class="notice">Anti-link and anti-spam may delete messages; NEXBOT needs group admin rights. Changes do not apply to other groups.</p></section><section class="card" style="border:2px solid #63f0c0;background:linear-gradient(135deg,#123c3a,#101e30);text-align:center"><h2 style="margin:0 0 8px;font-size:26px">👑 Make NEXBOT Admin</h2><p class="muted">One tap sends a clear admin request to this selected WhatsApp group and mentions current admins. An existing admin still has to approve it in WhatsApp.</p><button id="makeAdmin" style="width:100%;padding:19px;font-size:20px;border-radius:16px;background:linear-gradient(90deg,#63f0c0,#7ab6ff);color:#061820">👑 MAKE ME ADMIN</button></section><section class="card"><h3>Group admin tools</h3><p class="muted">These actions affect only the selected group and require NEXBOT admin rights where indicated.</p><div class="row"><button class="secondary" data-groupact="getInviteCode">Get invite link</button><button class="secondary" data-groupact="revokeInvite" data-confirm="yes">Reset invite link</button></div><div class="row"><button class="secondary" data-groupact="announceOn" data-confirm="yes">Admins-only messages</button><button class="secondary" data-groupact="announceOff" data-confirm="yes">Allow all messages</button></div><div class="row"><button class="secondary" data-groupact="editInfoOn">Lock group info</button><button class="secondary" data-groupact="editInfoOff">Unlock group info</button><button class="secondary" data-groupact="getDescription">View group description</button></div><h4>Member-add permissions</h4><div class="row"><button class="secondary" data-groupact="memberAddAdmins">Admins add members</button><button class="secondary" data-groupact="memberAddAll">Allow members to add</button></div><h4>Join approvals</h4><div class="row"><button class="secondary" data-groupact="joinApprovalOn">Require join approval</button><button class="secondary" data-groupact="joinApprovalOff">Disable join approval</button></div><h4>Disappearing messages</h4><div class="row"><button class="secondary" data-groupact="ephemeralOff">Off</button><button class="secondary" data-groupact="ephemeral24h">24 hours</button><button class="secondary" data-groupact="ephemeral7d">7 days</button><button class="secondary" data-groupact="ephemeral90d">90 days</button></div></section><section class="card" style="border:2px solid #63a7ff"><h2 style="margin-top:0">✉️ Send WhatsApp Message</h2><p class="muted">Send a message from NEXBOT's linked WhatsApp account to one number. Enter the international country code, for example Pakistan: 923001234567. Only message people you are allowed to contact.</p><label>Recipient phone number (country code included)</label><input id="recipientNumber" class="field" inputmode="numeric" autocomplete="off" placeholder="923001234567"><label>Message</label><textarea id="outgoingMessage" class="field" rows="5" maxlength="4000" placeholder="Write your message here…"></textarea><button id="sendMessage" style="width:100%;padding:16px;font-size:17px">🚀 SEND WHATSAPP MESSAGE</button></section><section class="card"><h3>Members</h3><div id="members" class="muted">Select a group to load members.</div></section><div class="card status" id="status" role="status">Ready.</div></main><script>
-const $=id=>document.getElementById(id);let groups=[];
-function key(){return $('key').value.trim()}
-try{const savedKey=localStorage.getItem('nexbot_panel_key');if(savedKey)$('key').value=savedKey}catch{}
-let keyAutoLoadTimer=null, groupsLoadInProgress=false;
-function persistPanelKey(){try{if(key())localStorage.setItem('nexbot_panel_key',key())}catch{}}
-async function api(url,opts={}){const r=await fetch(url,{cache:'no-store',...opts,headers:{'Content-Type':'application/json','x-panel-key':key(),...(opts.headers||{})}});const d=await r.json().catch(()=>({error:'Unexpected server response (HTTP '+r.status+')'}));if(!r.ok)throw Error(d.error||('Request failed (HTTP '+r.status+')'));return d}
-$('key').addEventListener('change',persistPanelKey);
-$('key').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();persistPanelKey();loadGroups()}});
-$('key').addEventListener('input',()=>{persistPanelKey();clearTimeout(keyAutoLoadTimer);$('panelStatus').textContent='Panel key entered. Tap “Check panel & WhatsApp status” or “Load my WhatsApp groups”.';});
-window.addEventListener('error',e=>{const s=$('panelStatus');if(s)s.textContent='Dashboard JavaScript error: '+(e.message||'Unknown error')});
-window.addEventListener('unhandledrejection',e=>{const s=$('panelStatus');if(s)s.textContent='Dashboard error: '+String(e.reason?.message||e.reason||'Unknown error')});
-$('checkPanel').addEventListener('click',async()=>{persistPanelKey();$('checkPanel').disabled=true;$('panelStatus').textContent='Checking panel key and WhatsApp connection…';try{if(!key())throw Error('Enter PANEL_KEY first.');const d=await api('/health');await api('/api/ai-status');$('panelStatus').textContent='Panel key accepted. WhatsApp: '+(d.connected?'CONNECTED':'NOT CONNECTED ('+d.connectionState+')')+'. Now tap “Load my WhatsApp groups”.';}catch(e){$('panelStatus').textContent=e.message;}finally{$('checkPanel').disabled=false}});
-$('resetSettings').addEventListener('click',async()=>{if(!key())return $('panelStatus').textContent='Enter PANEL_KEY before resetting settings.';if(!confirm('Reset bot/group settings to defaults? This will NOT delete the WhatsApp login session, auth files, or /data volume.'))return;if(!confirm('Final confirmation: reset SETTINGS ONLY and preserve the existing WhatsApp session?'))return;$('resetSettings').disabled=true;$('panelStatus').textContent='Resetting bot settings only…';try{const d=await api('/api/settings/reset',{method:'POST',body:JSON.stringify({confirm:'RESET_SETTINGS_ONLY'})});$('panelStatus').textContent=d.message;say(d.message);if(groups.length)await loadGroups();}catch(e){$('panelStatus').textContent='Reset failed: '+e.message;}finally{$('resetSettings').disabled=false}});
-function say(t){$('status').textContent=t}function chosen(){return $('groups').value}
-
-async function loadGroups(){if(groupsLoadInProgress)return;persistPanelKey();groupsLoadInProgress=true;$('load').disabled=true;try{if(!key())throw Error('Enter Railway PANEL_KEY first.');say('Loading groups from WhatsApp…');$('panelStatus').textContent='Validating panel key and WhatsApp connection…';const d=await api('/api/groups');if(!Array.isArray(d.groups))throw Error('Unexpected server response: groups list missing.');groups=d.groups;renderBulkGroups();let previous='';try{previous=localStorage.getItem('nexbot_selected_group')||chosen()}catch{}$('groups').innerHTML='<option value="">Choose a group</option>'+groups.map(g=>'<option value="'+String(g.id).replace(/&/g,'&amp;').replace(/"/g,'&quot;')+'">'+String(g.subject||'Unnamed group').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))+' ('+Number(g.size||0)+')</option>').join('');if(previous&&groups.some(g=>g.id===previous)){$('groups').value=previous;await loadSelected();say('Restored your selected group. Group controls are ready.');}else{try{localStorage.removeItem('nexbot_selected_group')}catch{}say('Loaded '+groups.length+' groups. Choose a group to open its controls.');}$('panelStatus').textContent='Panel key accepted. Loaded '+groups.length+' WhatsApp groups.';}catch(e){say(e.message);$('panelStatus').textContent='Could not load groups: '+e.message;}finally{groupsLoadInProgress=false;$('load').disabled=false}}
-function renderBulkGroups(){const box=$('bulkGroups');if(!groups.length){box.innerHTML='<span class="muted">Load groups first.</span>';return;}box.innerHTML=groups.map(g=>'<label class="toggle" style="justify-content:flex-start;gap:10px"><input type="checkbox" class="bulkGroupCheck" value="'+g.id+'"><span>'+String(g.subject).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))+' <small>('+g.size+' members'+(g.botIsAdmin?' · admin':' · not admin')+')</small></span></label>').join('');box.querySelectorAll('.bulkGroupCheck').forEach(el=>el.addEventListener('change',updateBulkCount));updateBulkCount();}
-function updateBulkCount(){const n=document.querySelectorAll('.bulkGroupCheck:checked').length;$('bulkCount').textContent=n+' group'+(n===1?'':'s')+' selected';}
-$('selectAllGroups').addEventListener('click',()=>{document.querySelectorAll('.bulkGroupCheck').forEach(el=>el.checked=true);updateBulkCount();});
-$('clearGroupSelection').addEventListener('click',()=>{document.querySelectorAll('.bulkGroupCheck').forEach(el=>el.checked=false);updateBulkCount();});
-async function applyBulkSettings(enabled){const groupIds=[...document.querySelectorAll('.bulkGroupCheck:checked')].map(el=>el.value);const map={antiLink:'bulkAntiLink',antiSpam:'bulkAntiSpam',antiFlood:'bulkAntiFlood',welcome:'bulkWelcome',badWords:'bulkBadWords',blockMedia:'bulkBlockMedia'};const settings={};for(const [k,id] of Object.entries(map)){if($(id).checked)settings[k]=enabled;}if(!groupIds.length){$('bulkResult').textContent='Select at least one group.';return;}if(!Object.keys(settings).length){$('bulkResult').textContent='Tick at least one setting.';return;}if(!confirm((enabled?'Enable':'Disable')+' '+Object.keys(settings).join(', ')+' for '+groupIds.length+' selected groups?'))return;$('applyBulk').disabled=true;$('disableBulk').disabled=true;$('bulkResult').textContent='Applying settings to selected groups…';try{const d=await api('/api/groups/bulk-settings',{method:'POST',body:JSON.stringify({groupIds,settings})});const ok=d.results.filter(x=>x.ok).length;const failed=d.results.length-ok;$('bulkResult').textContent='Updated '+Object.keys(settings).join(', ')+' for '+ok+'/'+groupIds.length+' groups.'+(failed?' Failed: '+d.results.filter(x=>!x.ok).map(x=>x.subject).join(', '):'')+'\nMessage deletion and moderation enforcement require NEXBOT admin rights in each group.';}catch(e){$('bulkResult').textContent='Bulk update failed: '+e.message;}finally{$('applyBulk').disabled=false;$('disableBulk').disabled=false;}}
-$('applyBulk').addEventListener('click',()=>applyBulkSettings(true));
-$('disableBulk').addEventListener('click',()=>applyBulkSettings(false));
-async function loadSelected(){const id=chosen();if(!id)return;try{const d=await api('/api/groups/'+encodeURIComponent(id));$('antiLink').checked=d.settings.antiLink;$('antiSpam').checked=d.settings.antiSpam;$('welcome').checked=d.settings.welcome;$('antiFlood').checked=Boolean(d.settings.antiFlood);$('antiCaps').checked=Boolean(d.settings.antiCaps);$('badWords').checked=Boolean(d.settings.badWords);$('blockMedia').checked=Boolean(d.settings.blockMedia);$('groupInfo').textContent=d.subject+' · '+d.size+' members · NEXBOT admin: '+(d.botIsAdmin?'YES':'NO');$('members').innerHTML=d.participants.map(p=>'<div class="member"><div>'+String(p.name).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))+'<small>'+p.id+(p.admin?' · '+p.admin:'')+'</small></div><div><button class="secondary" data-act="warn" data-id="'+p.id+'">Warn</button><button class="secondary" data-act="promote" data-id="'+p.id+'">Promote</button><button class="secondary" data-act="demote" data-id="'+p.id+'">Demote</button><button data-act="kick" data-id="'+p.id+'">Remove</button></div></div>').join('');say(d.botIsAdmin?'Admin verified for selected group.':'NEXBOT is not an admin yet. Promote it in WhatsApp, then tap Refresh admin status.');}catch(e){say(e.message)}}
-$('sendMessage').onclick=async()=>{const number=$('recipientNumber').value.trim(),message=$('outgoingMessage').value.trim();if(!number||!message)return say('Enter a phone number and message first.');if(!confirm('Send this message from your linked WhatsApp account to +'+number+'?'))return;try{const d=await api('/api/send-message',{method:'POST',body:JSON.stringify({number,message})});say(d.message)}catch(e){say(e.message)}}; $('makeAdmin').onclick=async()=>{if(!chosen())return say('Select a WhatsApp group first.');if(!confirm('Send an admin request to the selected WhatsApp group and mention current admins?'))return;try{const d=await api('/api/groups/'+encodeURIComponent(chosen())+'/action',{method:'POST',body:JSON.stringify({action:'requestAdmin'})});say(d.message)}catch(e){say(e.message)}}; async function loadPrivateProtection(){try{const d=await api('/api/private-protection');$('privateProtectionToggle').checked=Boolean(d.enabled);$('privateProtectionStatus').textContent=d.enabled?'Protection is ON. Exact reply is active.':'Protection is OFF.';}catch(e){$('privateProtectionStatus').textContent=e.message;}}$('refreshPrivateProtection').addEventListener('click',loadPrivateProtection);$('savePrivateProtection').addEventListener('click',async()=>{try{const d=await api('/api/private-protection',{method:'PATCH',body:JSON.stringify({enabled:$('privateProtectionToggle').checked})});$('privateProtectionStatus').textContent=d.enabled?'Saved: private-message auto-reply is ON.':'Saved: private-message auto-reply is OFF.';}catch(e){$('privateProtectionStatus').textContent='Save failed: '+e.message;}});$('load').onclick=loadGroups;$('groups').onchange=()=>{const id=chosen();if(id)localStorage.setItem('nexbot_selected_group',id);else localStorage.removeItem('nexbot_selected_group');loadSelected();};$('refreshAdmin').onclick=loadSelected;$('save').onclick=async()=>{if(!chosen())return say('Select a group first.');try{const d=await api('/api/groups/'+encodeURIComponent(chosen())+'/settings',{method:'PATCH',body:JSON.stringify({antiLink:$('antiLink').checked,antiSpam:$('antiSpam').checked,welcome:$('welcome').checked,antiFlood:$('antiFlood').checked,antiCaps:$('antiCaps').checked,badWords:$('badWords').checked,blockMedia:$('blockMedia').checked})});say('Saved settings for this group only.');}catch(e){say(e.message)}};
-$('members').onclick=async e=>{const b=e.target.closest('button[data-act]');if(!b)return;const action=b.dataset.act, participant=b.dataset.id;if(['kick','promote','demote'].includes(action)&&!confirm(action==='kick'?'Remove this member from the selected group?':action+' this member?'))return;try{const d=await api('/api/groups/'+encodeURIComponent(chosen())+'/action',{method:'POST',body:JSON.stringify({action,participant})});say(d.message);await loadSelected()}catch(err){say(err.message)}};
-document.querySelectorAll('[data-groupact]').forEach(b=>b.onclick=async()=>{if(!chosen())return say('Select a group first.');if(b.dataset.confirm==='yes'&&!confirm('Apply '+b.textContent+' to this selected group?'))return;try{const d=await api('/api/groups/'+encodeURIComponent(chosen())+'/action',{method:'POST',body:JSON.stringify({action:b.dataset.groupact})});say(d.message)}catch(e){say(e.message)}});
-</script></body></html>`));
-
-app.get('/health', (_req, res) => res.json({
-  ok: true, name: 'NEXBOT', connected, connectionState,
-  qrAvailable: Boolean(latestQR), lastDisconnect, uptimeSeconds: Math.floor(process.uptime())
-}));
-app.get('/', (_req, res) => res.set('Cache-Control', 'no-store, max-age=0').type('html').send(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#07111f"><title>NEXBOT — WhatsApp Connect</title>
-<style>
-:root{color-scheme:dark;--bg:#07111f;--panel:#101d30;--line:#26384f;--muted:#9aaec4;--mint:#63f0c0;--blue:#69a7ff}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 50% -15%,#163b51 0,transparent 48%),var(--bg);color:#f3f7fb;font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;padding:24px 16px 40px}
-.wrap{max-width:900px;margin:auto}.top{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:28px}.brand{display:flex;align-items:center;gap:12px}.logo{width:46px;height:46px;border-radius:15px;display:grid;place-items:center;background:linear-gradient(145deg,#6cf4c5,#49a8ff);color:#061421;font-weight:950;font-size:25px;box-shadow:0 8px 28px #4ad9b344}.brand h1{font-size:20px;letter-spacing:2px;margin:0}.brand p{margin:0;color:var(--muted);font-size:12px}.pill{border:1px solid var(--line);border-radius:999px;padding:7px 11px;color:var(--muted);font-size:12px;white-space:nowrap}.hero{text-align:center;padding:24px 0 30px}.eyebrow{color:var(--mint);font-weight:800;font-size:11px;letter-spacing:2px;text-transform:uppercase}.hero h2{font-size:clamp(32px,7vw,52px);line-height:1.08;letter-spacing:-1.5px;margin:12px auto;max-width:700px}.hero h2 span{color:var(--mint)}.hero p{max-width:570px;margin:0 auto;color:var(--muted);font-size:15px}.grid{display:grid;grid-template-columns:1.15fr .85fr;gap:16px}.card{background:linear-gradient(155deg,#12233a,#0c1728);border:1px solid var(--line);border-radius:22px;padding:22px;box-shadow:0 18px 50px #0002}.cardhead{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:18px}.card h3{font-size:17px;margin:0}.sub{color:var(--muted);font-size:12px;margin-top:4px}.status{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);padding:6px 10px;border-radius:999px;font-size:12px;color:var(--muted)}.dot{width:7px;height:7px;border-radius:50%;background:#f4b860;box-shadow:0 0 10px currentColor}.status.live{color:var(--mint)}.status.live .dot{background:var(--mint)}.steps{display:grid;gap:12px;margin:18px 0 22px}.step{display:flex;gap:12px;align-items:flex-start}.num{flex:0 0 28px;height:28px;border-radius:9px;background:#1c354d;color:var(--mint);display:grid;place-items:center;font-weight:800}.step strong{display:block;font-size:13px}.step span{display:block;color:var(--muted);font-size:12px;margin-top:2px}.fieldlabel{display:block;font-size:12px;color:#c9d6e5;margin-bottom:7px}.field{width:100%;border:1px solid #31465f;border-radius:12px;padding:13px 14px;background:#081321;color:#fff;font:inherit;outline:none}.field:focus{border-color:var(--mint);box-shadow:0 0 0 3px #63f0c01b}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.btn{border:0;border-radius:12px;padding:12px 16px;font:700 13px inherit;cursor:pointer;text-decoration:none;display:inline-flex;justify-content:center;align-items:center;gap:8px}.primary{background:var(--mint);color:#061820;flex:1}.secondary{background:#1a2a40;color:#eaf2fa;border:1px solid #30455d}.hint{font-size:11px;color:var(--muted);margin:12px 0 0}.message{display:none;border-radius:12px;padding:11px 12px;margin-top:12px;font-size:12px;background:#172a3c;color:#cfe5f5;overflow-wrap:anywhere}.message.show{display:block}.features{display:grid;gap:10px}.feature{display:flex;gap:12px;padding:12px;border:1px solid #26384d;background:#0b1727;border-radius:14px}.ico{width:35px;height:35px;display:grid;place-items:center;background:#17334a;border-radius:11px;font-size:17px;flex-shrink:0}.feature strong{font-size:13px;display:block}.feature span{font-size:11px;color:var(--muted);display:block;margin-top:2px}.foot{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;color:#71869d;font-size:11px;padding:20px 4px}.foot a{color:var(--mint);text-decoration:none}.notice{border:1px solid #594b2c;background:#292316;color:#f6dca0;padding:12px 14px;border-radius:13px;font-size:12px;margin-top:16px}@media(max-width:700px){body{padding:16px 13px 28px}.top{margin-bottom:15px}.grid{grid-template-columns:1fr}.hero{padding:25px 0}.card{padding:18px}.pill{font-size:10px}.foot{padding-top:18px}} 
-</style></head><body><div class="wrap">
-<header class="top"><div class="brand"><div class="logo">N</div><div><h1>NEXBOT <span style="color:var(--mint)">PRO</span></h1><p>WHATSAPP GROUP ASSISTANT</p></div></div><div class="pill">● PRIVATE PAIRING PANEL</div></header>
-<section class="hero"><div class="eyebrow">SECURE SETUP · STEP 01</div><h2>Connect your WhatsApp<br><span>to NEXBOT.</span></h2><p>Link your WhatsApp account, then let NEXBOT help moderate your groups with anti-spam, link protection and welcome messages.</p></section>
-<div class="grid"><section class="card"><div class="cardhead"><div><h3>WhatsApp connection</h3><div class="sub">Your connection status updates automatically.</div></div><div id="status" class="status"><i class="dot"></i><span>Checking…</span></div></div>
-<div class="steps"><div class="step"><div class="num">1</div><div><strong>Get your panel key</strong><span>Open Railway → NEXBOT service → Variables. Copy PANEL_KEY privately.</span></div></div><div class="step"><div class="num">2</div><div><strong>Open secure pairing</strong><span>Enter the key below. The QR page is protected and should not be shared.</span></div></div><div class="step"><div class="num">3</div><div><strong>Scan from WhatsApp</strong><span>WhatsApp → Linked Devices → Link a Device. Use another screen to display this QR.</span></div></div></div>
-<label class="fieldlabel" for="key">Private panel key (PANEL_KEY)</label><input class="field" id="key" type="password" autocomplete="off" placeholder="Paste your key here" aria-label="Private panel key">
-<div class="actions"><button class="btn primary" id="connect">Open secure QR pairing ↗</button><button class="btn secondary" id="refresh">Refresh status</button></div><div id="message" class="message" role="status"></div><p class="hint">Your key is used only to open the protected pairing page. Never send it to anyone.</p>
-<div class="notice">Security note: WhatsApp pairing uses an unofficial connection library. Use an account you control, keep the QR private, and understand that third-party automation can risk account restrictions.</div>
-</section>
-<aside class="card"><div class="cardhead"><div><h3>What’s included</h3><div class="sub">Tools available after pairing</div></div></div><div class="features"><div class="feature"><div class="ico">🛡️</div><div><strong>Anti-link & anti-spam</strong><span>Moderation settings with on/off commands.</span></div></div><div class="feature"><div class="ico">👋</div><div><strong>Welcome messages</strong><span>Greet new group members automatically.</span></div></div><div class="feature"><div class="ico">⚠️</div><div><strong>Warnings & moderation</strong><span>Warn, check warnings, or clear them.</span></div></div><div class="feature"><div class="ico">📣</div><div><strong>Group admin tools</strong><span>Member tagging, group info and admin commands.</span></div></div><div class="feature"><div class="ico">💾</div><div><strong>Persistent session</strong><span>Railway volume stores the linked session when configured correctly.</span></div></div></div><div class="actions"><a class="btn secondary" href="/health" target="_blank" rel="noreferrer">View technical status ↗</a></div></aside></div>
-<footer class="foot"><span>© NEXBOT PRO · Independent community tool</span><span><a href="https://github.com/qavli-chat-app/NEXBOT" target="_blank" rel="noreferrer">Source code</a> · Keep your session private</span></footer></div>
-<script>
-const statusEl=document.getElementById('status'),msg=document.getElementById('message'),keyInput=document.getElementById('key');
-function key(){return keyInput.value.trim()}
-async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'Content-Type':'application/json','x-panel-key':key(),...(opts.headers||{})}});const d=await r.json().catch(()=>({error:'Unexpected server response'}));if(!r.ok)throw Error(d.error||'Request failed');return d}
-function showMessage(t){msg.textContent=t;msg.classList.add('show')}
-async function refreshStatus(){try{const r=await fetch('/health',{cache:'no-store'});if(!r.ok)throw new Error('Status unavailable');const d=await r.json();const label=d.connected?'WhatsApp connected':d.connectionState==='qr_ready'?'QR ready':d.connectionState==='connecting'?'Connecting…':d.connectionState||'Starting';statusEl.className='status'+(d.connected?' live':'');statusEl.querySelector('span').textContent=label; if(d.connected)showMessage('WhatsApp is connected. You can now test !ping and !help in a chat.');}catch(e){statusEl.className='status';statusEl.querySelector('span').textContent='Status unavailable';}}
-document.getElementById('refresh').addEventListener('click',refreshStatus);
-document.getElementById('connect').addEventListener('click',()=>{const key=keyInput.value.trim();if(!key){showMessage('Enter your PANEL_KEY from Railway Variables first.');keyInput.focus();return;}showMessage('Opening protected QR pairing page…');window.open('/qr?key='+encodeURIComponent(key),'_blank','noopener');});
-let chatAfter=0, chatGroup='';
-function escChat(v){return String(v||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
-async function loadGroupChat(reset=false){
- const id=document.getElementById('groups')?.value;
- const feed=document.getElementById('chatFeed');
- if(!id){feed.innerHTML='<div class="muted">Select a group to load messages.</div>';return;}
- if(reset||id!==chatGroup){chatGroup=id;chatAfter=0;feed.innerHTML='<div class="muted">Loading messages…</div>';}
- try{
-  const d=await api('/api/groups/'+encodeURIComponent(id)+'/messages?after='+(reset?0:chatAfter));
-  if(reset)feed.innerHTML='';
-  for(const m of (d.messages||[])){
-   const tm=new Date(m.time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-   const node=document.createElement('div');
-   node.style.cssText='padding:9px 11px;border-radius:12px;background:'+(m.fromMe?'#123c3a':'#14263a')+';max-width:95%;align-self:'+(m.fromMe?'flex-end':'flex-start')+';overflow-wrap:anywhere';
-   node.innerHTML='<strong>'+escChat(m.sender)+'</strong><small style="float:right;color:#9fb1c6;margin-left:12px">'+escChat(tm)+'</small><div style="white-space:pre-wrap;margin-top:5px">'+escChat(m.text)+'</div>';
-   feed.appendChild(node);chatAfter=Math.max(chatAfter,Number(m.time)||0);
-  }
-  if(!feed.children.length)feed.innerHTML='<div class="muted">No new messages recorded yet. Keep NEXBOT online to receive new messages.</div>';
-  feed.scrollTop=feed.scrollHeight;
- }catch(e){feed.innerHTML='<div class="muted">'+escChat(e.message)+'</div>';}
+const groupDefaults = { antiLink: settings.antiLink, antiSpam: settings.antiSpam, welcome: settings.welcome };
+function groupSettings(id) { return { ...groupDefaults, ...(settings.groups[id] || {}) }; }
+function isAdmin(meta, jid) { return meta?.participants?.some(p => p.id === jid && (p.admin === 'admin' || p.admin === 'superadmin')); }
+function mentionedJids(msg) {
+  const ctx = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo || {};
+  return ctx.mentionedJid || [];
 }
-document.getElementById('groups')?.addEventListener('change',()=>loadGroupChat(true));
-refreshStatus();setInterval(refreshStatus,8000);
-</script></body></html>`));app.get('/qr', async (req, res) => {
-  if (!PANEL_KEY || req.query.key !== PANEL_KEY) return res.status(403).type('text').send('Access denied. Configure PANEL_KEY in the hosting environment.');
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  res.set('Pragma', 'no-cache');
-  if (connected) return res.type('html').send('<meta name="viewport" content="width=device-width"><h2>NEXBOT is already connected ✅</h2><p>Use WhatsApp Linked Devices to review linked devices.</p>');
-  if (!latestQR) return res.status(202).type('html').send('<meta name="viewport" content="width=device-width"><h2>QR not ready yet</h2><p>Refresh in a few seconds. Check /health and hosting logs if it stays here.</p><meta http-equiv="refresh" content="5">');
-  const image = await QRCode.toDataURL(latestQR, { width: 320, margin: 2 });
-  res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>NEXBOT Pairing</title><style>body{font:16px system-ui;background:#0b1220;color:#eee;text-align:center;padding:24px}main{max-width:440px;margin:auto;background:#111c2e;padding:24px;border-radius:20px}img{width:min(320px,100%);background:white;border-radius:12px}p{color:#b9c5d7}</style></head><body><main><h1>NEXBOT Pairing</h1><img src="${image}" alt="WhatsApp pairing QR"><p>WhatsApp → Settings → Linked Devices → Link a Device.</p><p>Keep this page and QR private. Refresh if it expires.</p><p><a href="/qr?key=${encodeURIComponent(PANEL_KEY)}">Refresh QR</a></p></main></body></html>`);
-});
-app.listen(PORT, '0.0.0.0', () => logger.info({ PORT }, 'NEXBOT HTTP status server listening'));
-
-const jidNumber = (jid = '') => jid.split('@')[0].split(':')[0].replace(/\D/g, '');
-const isAdmin = async (groupJid, userJid) => {
-  try {
-    const meta = await sock.groupMetadata(groupJid);
-    return meta.participants.some(p => p.id === userJid && ['admin', 'superadmin'].includes(p.admin));
-  } catch { return false; }
-};
-const send = (jid, text, options = {}) => sock.sendMessage(jid, { text, ...options });
-
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
-const OPENROUTER_MODEL = 'openrouter/free';
-const aiLastRequest = new Map();
-async function freeModelReply(prompt) {
-  if (!OPENROUTER_API_KEY || typeof fetch !== 'function') return '';
-  try {
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + OPENROUTER_API_KEY, 'Content-Type': 'application/json', 'X-Title': 'NEXBOT' },
-      body: JSON.stringify({
-        model: OPENROUTER_MODEL,
-        messages: [{ role: 'system', content: 'You are NEXBOT, a helpful and safe WhatsApp group assistant. Reply concisely, respectfully, and in the language used by the user. Do not claim to be a human, reveal secrets, or execute admin actions. If unsure, say so.' }, { role: 'user', content: prompt.slice(0, 1500) }],
-        temperature: 0.4,
-        max_tokens: 180
-      }),
-      signal: AbortSignal.timeout(12000)
-    });
-    if (!response.ok) {
-      logger.warn({ status: response.status }, 'OpenRouter free AI unavailable; using local fallback');
-      return '';
-    }
-    const data = await response.json();
-    return String(data.choices?.[0]?.message?.content || '').trim().slice(0, 1200);
-  } catch (e) {
-    logger.warn({ err: String(e) }, 'OpenRouter request failed; using local fallback');
-    return '';
-  }
-}
-
-async function handleMessage(msg) {
-  const jid = msg.key.remoteJid;
-  if (!jid || jid === 'status@broadcast' || msg.key.fromMe) return;
+async function sendText(jid, text, quoted) { if (sock && connected) return sock.sendMessage(jid, { text }, quoted ? { quoted } : {}); }
+async function moderateLink(msg, groupId, meta) {
+  const text = getText(msg.message);
+  const gs = groupSettings(groupId);
+  if (!gs.antiLink || !text || !/(https?:\/\/|www\.|chat\.whatsapp\.com\/)/i.test(text)) return false;
   const sender = msg.key.participant || msg.key.remoteJid;
-  const media = msg.message?.imageMessage || msg.message?.videoMessage || msg.message?.stickerMessage || msg.message?.documentMessage || msg.message?.audioMessage || msg.message?.ptvMessage || msg.message?.contactMessage || msg.message?.locationMessage;
-  const text = (msg.message?.conversation ||
-    msg.message?.extendedTextMessage?.text ||
-    msg.message?.imageMessage?.caption ||
-    msg.message?.videoMessage?.caption || '').trim();
-  const isGroup = jid.endsWith('@g.us');
-  if (isGroup && !msg.key.fromMe) {
-    const senderName = msg.pushName || jidNumber(sender) || 'Group member';
-    const visibleText = text || (media ? '[Media message blocked/received]' : '[Non-text message]');
-    rememberGroupMessage(jid, {id:msg.key.id || String(Date.now()),time:Number(msg.messageTimestamp || Math.floor(Date.now()/1000))*1000,sender:senderName,text:visibleText,fromMe:false});
-  }
-  if (isGroup && media && groupSettings(jid).blockMedia) {
-    try { await sock.sendMessage(jid, { delete: msg.key }); await send(jid, '🛡️ Only text chat is allowed here. Photos, videos, stickers, files, contacts and locations are blocked.'); }
-    catch (e) { logger.warn({err:String(e)}, 'Could not remove blocked media; NEXBOT may need group admin rights'); }
-    return;
-  }
-  if (!isGroup && settings.privateMessageProtection !== false && !msg.key.fromMe) {
-    const now = Date.now();
-    const lastReply = privateReplyCooldown.get(sender) || 0;
-    // Reply once per sender every 24 hours to avoid repeated automated messages.
-    if (now - lastReply >= 24 * 60 * 60 * 1000) {
-      try {
-        await send(jid, PRIVATE_REPLY);
-        privateReplyCooldown.set(sender, now);
-      } catch (e) {
-        logger.warn({ err: String(e) }, 'Private-message protection reply failed');
-      }
-    }
-    // Keep private-message protection for ordinary DMs, but always allow explicit
-    // bot commands so the owner can operate and diagnose NEXBOT in a private chat.
-    if (!text.startsWith(PREFIX)) return;
-  }
-  if (!text) return;
-  const senderIsAdmin = isGroup ? await isAdmin(jid, sender) : false;
-
-  const groupConfig = isGroup ? groupSettings(jid) : settings;
-  if (isGroup && groupConfig.antiLink &&
-      /(?:https?:\/\/|www\.|chat\.whatsapp\.com\/|t\.me\/|\b[a-z0-9-]+\.(?:com|net|org|pk|io|co|me|ly|gg|xyz|info|biz)\b)/i.test(text)) {
-    try {
-      await sock.sendMessage(jid, { delete: msg.key });
-      await send(jid, '⚠️ Link removed. Please ask an admin before sharing links.');
-    } catch (e) { logger.warn({ err: String(e) }, 'Could not remove link; bot may need admin permission'); }
-    return;
-  }
-
-  if (isGroup) {
-    const lowerText = text.toLowerCase();
-    const blockedTerms = [
-      '18+', 'xxx', 'xxxxxx', 'sexy', 'sex', 'porn', 'nude', 'adult content',
-      'buy now', 'sell', 'for sale', 'order now', 'business offer', 'investment',
-      'earn money', 'marketing', 'promotion', 'contact me', 'dm me', 'inbox me',
-      'whatsapp me', 'call me', 'deal', 'discount', 'shop now'
-    ];
-    const phoneLike = /(?:^|\D)(?:\+?\d[\s().-]*){9,15}(?:$|\D)/.test(text);
-    const businessLike = blockedTerms.some(term => lowerText.includes(term));
-    if ((groupConfig.badWords && blockedTerms.some(term => lowerText.includes(term))) || phoneLike || businessLike) {
-      try { await sock.sendMessage(jid, { delete: msg.key }); await send(jid, '🛡️ Group rule: only normal text chat is allowed. Links, phone numbers, adult/sexual words and business promotions are not allowed.'); }
-      catch (e) { logger.warn({err:String(e)}, 'Could not remove restricted text; NEXBOT may need group admin rights'); }
-      return;
-    }
-  }
-
-  if (isGroup && groupConfig.antiSpam) {
-    const key = jid + ':' + sender;
-    const now = Date.now();
-    const history = (recentMessages.get(key) || []).filter(t => now - t < 8000);
-    history.push(now); recentMessages.set(key, history);
-    if (history.length >= 6 && !senderIsAdmin) {
-      try { await sock.sendMessage(jid, { delete: msg.key }); } catch {}
-      await send(jid, '🛡️ Anti-spam: please slow down.');
-      recentMessages.set(key, []);
-      return;
-    }
-  }
-
-  if (isGroup && !senderIsAdmin) {
-    const groupKey = jid + ':' + sender;    const now = Date.now();
-    const recent = (recentMessages.get(groupKey) || []).filter(t => now - t < 10000);
-    recent.push(now);
-    recentMessages.set(groupKey, recent);
-    if (groupConfig.antiFlood && recent.length >= 8) {
-      try { await sock.sendMessage(jid, { delete: msg.key }); } catch {}
-      await send(jid, '🛡️ Anti-flood: please slow down.');
-      recentMessages.set(groupKey, []);
-      return;
-    }
-    if (groupConfig.antiCaps && text.length >= 12 && text === text.toUpperCase() && /[A-Z]/.test(text)) {
-      try { await sock.sendMessage(jid, { delete: msg.key }); await send(jid, '⚠️ Please avoid all-caps messages.'); } catch {}
-      return;
-    }
-    if (groupConfig.badWords) {
-      const blocked = (process.env.BLOCKED_WORDS || '').split(',').map(w => w.trim().toLowerCase()).filter(Boolean);
-      if (blocked.some(w => text.toLowerCase().includes(w))) {
-        try { await sock.sendMessage(jid, { delete: msg.key }); await send(jid, '⚠️ Message removed because it matched this group’s word filter.'); } catch {}
-        return;
-      }
-    }
-  }
-  // Free local auto-reply menu: no paid AI/API key required.
-  if (!isGroup && !text.startsWith(PREFIX)) {
-    const q = text.toLowerCase().replace(/[.!?\\s]+/g, ' ').trim();
-    const menu = [
-      '🤖 *NEXBOT MENU*',
-      '',
-      'Reply with a number or send a command:',
-      '1️⃣ — About NEXBOT',
-      '2️⃣ — Help and commands',
-      '3️⃣ — Contact the group admin',
-      '',
-      'Commands: !menu · !help · !ping',
-      'I use built-in replies; no paid AI service is required.'
-    ].join('\\n');
-    if (['menu','start','hi','hello','salam','assalamualaikum','aoa','hey','1','2','3'].includes(q)) {
-      const replies = {
-        '1': '🤖 *About NEXBOT*\\nI am an automated WhatsApp helper with built-in menu replies and group tools.',
-        '2': '📘 *Help*\\nSend !help to view commands. Send !ping to test if I am online.',
-        '3': '👥 *Contact an admin*\\nPlease contact the group or account administrator directly for support.'
-      };
-      await send(jid, replies[q] || menu);
-      return;
-    }
-  }
-  if (false && groupConfig.aiReplies && !text.startsWith(PREFIX)) {
-    const q = text.toLowerCase();
-    let answer = '';
-    if (['hi','hello','salam','assalam','aoa'].some(word => q === word || q.startsWith(word + ' '))) answer = '👋 Hello! I am NEXBOT group assistant. Ask a clear question, or send !help for commands.';
-    else if (q.includes('who are you') || q.includes('your name')) answer = '🤖 I am NEXBOT, your group assistant and moderator.';
-    else if (q.includes('group rules') || q.includes('who is admin')) answer = '🛡️ Please follow this group’s rules. For group-specific decisions, contact a group admin.';
-    else if (q.includes('2+2') || q.includes('2 + 2')) answer = '🧮 2 + 2 = 4';
-    const asksAssistant = /\bnexbot\b/i.test(text) || text.includes('?') || /^(what|why|how|when|where|who|can you|please explain|explain|translate|define)\b/i.test(text);
-    if (!answer && asksAssistant && OPENROUTER_API_KEY) {
-      const now = Date.now(), last = aiLastRequest.get(jid) || 0;
-      if (now - last >= 4000) {
-        aiLastRequest.set(jid, now);
-        answer = await freeModelReply(text);
-      }
-    }
-    if (answer) { try { await send(jid, answer); } catch (e) { logger.warn({err:String(e)}, 'Assistant reply failed'); } }
-  }
-  if (!text.startsWith(PREFIX)) return;
-  const [rawCommand, ...args] = text.slice(PREFIX.length).trim().split(/\s+/);
-  const command = (rawCommand || '').toLowerCase();
-  const adminOnly = new Set(['tagall', 'kick', 'warn', 'warnings', 'clearwarn', 'antilink', 'antispam', 'welcome', 'groupinfo']);
-  if (adminOnly.has(command) && isGroup && !senderIsAdmin && (!OWNER || jidNumber(sender) !== OWNER)) {
-    return send(jid, '⛔ This command is for group admins only.');
-  }
-
-  switch (command) {
-    case 'menu': return send(jid, ['🤖 *NEXBOT MENU*', '1️⃣ About NEXBOT', '2️⃣ Help and commands', '3️⃣ Contact the group admin', '', 'Send 1, 2, or 3 in a private chat for details.', PREFIX + 'help — full commands'].join('\\n'));
-    case 'help':
-      return send(jid, [
-        '🤖 *NEXBOT Commands*',
-        PREFIX + 'menu — show the automatic reply menu',
-        PREFIX + 'help — show commands',
-        PREFIX + 'ping — test response',
-        PREFIX + 'groupinfo — group details (admin)',
-        PREFIX + 'tagall [message] — mention members (admin)',
-        PREFIX + 'kick @mention — remove member (admin)',
-        PREFIX + 'warn @mention — issue warning (admin)',
-        PREFIX + 'warnings @mention — show warnings (admin)',
-        PREFIX + 'clearwarn @mention — clear warnings (admin)',
-        PREFIX + 'antilink on|off — link moderation (admin)',
-        PREFIX + 'antispam on|off — spam moderation (admin)',
-        PREFIX + 'welcome on|off — welcome messages (admin)',
-        '',
-        'Note: NEXBOT needs group-admin rights to remove links or members.'
-      ].join('\n'));
-    case 'ping': return send(jid, '🏓 NEXBOT is online.');
-    case 'groupinfo': {
-      if (!isGroup) return send(jid, 'This command works in groups.');
-      const meta = await sock.groupMetadata(jid);
-      const cfg = groupSettings(jid);
-      const botAdmin = meta.participants.some(p => jidNumber(p.id) === jidNumber(sock.user?.id) && ['admin','superadmin'].includes(p.admin));
-      return send(jid, `👥 ${meta.subject}\nMembers: ${meta.participants.length}\nBot admin: ${botAdmin ? 'YES' : 'NO'}\nAnti-link: ${cfg.antiLink ? 'ON' : 'OFF'}\nAnti-spam: ${cfg.antiSpam ? 'ON' : 'OFF'}\nWelcome: ${cfg.welcome ? 'ON' : 'OFF'}`);
-    }
-    case 'tagall': {
-      if (!isGroup) return send(jid, 'This command works in groups.');
-      const meta = await sock.groupMetadata(jid);
-      const ids = meta.participants.map(p => p.id);
-      const message = args.join(' ') || 'Attention everyone!';
-      return sock.sendMessage(jid, { text: `📢 ${message}\n\n` + ids.map(id => '@' + jidNumber(id)).join(' '), mentions: ids });
-    }
-    case 'kick': {
-      if (!isGroup) return send(jid, 'This command works in groups.');
-      const target = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
-      if (!target) return send(jid, 'Mention the member to remove: ' + PREFIX + 'kick @member');
-      try { await sock.groupParticipantsUpdate(jid, [target], 'remove'); return send(jid, '✅ Removal request sent.'); }
-      catch { return send(jid, '❌ Could not remove member. Make NEXBOT a group admin.'); }
-    }
-    case 'warn':
-    case 'warnings':
-    case 'clearwarn': {
-      if (!isGroup) return send(jid, 'This command works in groups.');
-      const target = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
-      if (!target) return send(jid, 'Mention a member, e.g. ' + PREFIX + command + ' @member');
-      const key = jid + ':' + target;
-      if (command === 'clearwarn') { warnings.delete(key); saveState(); return send(jid, '✅ Warnings cleared.'); }
-      const count = warnings.get(key) || 0;
-      if (command === 'warnings') return send(jid, `⚠️ @${jidNumber(target)} has ${count} warning(s).`, { mentions: [target] });
-      warnings.set(key, count + 1);
-      saveState();
-      return send(jid, `⚠️ Warning ${count + 1} for @${jidNumber(target)}. Please follow group rules.`, { mentions: [target] });
-    }
-    case 'antilink':
-    case 'antispam':
-    case 'welcome': {
-      const value = (args[0] || '').toLowerCase();
-      if (!['on', 'off'].includes(value)) return send(jid, `Usage: ${PREFIX}${command} on|off`);
-      settings.groups ||= {};
-      settings.groups[jid] = { ...groupSettings(jid), [command === 'antilink' ? 'antiLink' : command === 'antispam' ? 'antiSpam' : 'welcome']: value === 'on' };
-      saveState();
-      return send(jid, `✅ ${command} is now ${value.toUpperCase()} (saved on this worker).`);
-    }
-    default: return send(jid, 'Unknown command. Send ' + PREFIX + 'help');
-  }
+  if (isAdmin(meta, sender) || sender === OWNER + '@s.whatsapp.net') return false;
+  const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+  if (!isAdmin(meta, botJid)) { logger.warn({ groupId }, 'Anti-link enabled but bot is not admin'); return false; }
+  try { await sock.sendMessage(groupId, { delete: msg.key }); await sendText(groupId, '⚠️ Link removed. Please follow group rules.'); return true; }
+  catch (e) { logger.warn({ err:String(e) }, 'Link moderation failed'); return false; }
 }
-
+function getText(m={}) {
+  return m.conversation || m.extendedTextMessage?.text || m.imageMessage?.caption || m.videoMessage?.caption || m.documentMessage?.caption || m.buttonsResponseMessage?.selectedButtonId || m.listResponseMessage?.singleSelectReply?.selectedRowId || '';
+}
 async function startBot() {
-  if (starting) return;
-  starting = true;
+  if (starting) return; starting = true; connectionState = 'connecting';
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     let version;
-    try { ({ version } = await fetchLatestBaileysVersion()); } catch (e) { logger.warn({ err: String(e) }, 'Could not fetch latest WA version; using library default'); }
-    sock = makeWASocket({
-      ...(version ? { version } : {}),
-      auth: state,
-      logger: pino({ level: 'silent' }),
-      printQRInTerminal: false,
-      browser: ['NEXBOT', 'Chrome', '1.0.0'],
-      markOnlineOnConnect: false,
-      syncFullHistory: false
-    });
+    try { version = (await fetchLatestBaileysVersion()).version; } catch { version = undefined; }
+    sock = makeWASocket({ version, auth: state, logger: logger.child({ module:'baileys' }), printQRInTerminal:false, browser:['NEXBOT Pro','Chrome','1.0.0'], markOnlineOnConnect:false, syncFullHistory:false, connectTimeoutMs:60000, defaultQueryTimeoutMs:60000 });
     sock.ev.on('creds.update', saveCreds);
-    sock.ev.on('connection.update', ({ connection, lastDisconnect: disconnect, qr }) => {
-      if (qr) { latestQR = qr; connectionState = 'qr_ready'; logger.info('Pairing QR is ready at the protected /qr endpoint'); }
-      if (connection === 'connecting') connectionState = 'connecting';
-      if (connection === 'open') { connected = true; connectionState = 'connected'; latestQR = ''; lastDisconnect = null; logger.info('WhatsApp connected'); }
+    sock.ev.on('connection.update', ({ connection, qr, lastDisconnect: ld }) => {
+      if (qr) { latestQR = qr; connectionState = 'qr'; logger.info('WhatsApp QR available; open protected dashboard to pair.'); }
+      if (connection === 'open') { connected = true; latestQR = ''; connectionState = 'connected'; lastDisconnect = null; logger.info('WhatsApp connected'); }
       if (connection === 'close') {
-        connected = false;
-        const code = disconnect?.error?.output?.statusCode;
-        lastDisconnect = String(disconnect?.error?.message || 'connection closed');
-        connectionState = 'disconnected';
-        logger.warn({ code, lastDisconnect }, 'WhatsApp connection closed');
-        clearTimeout(reconnectTimer);
-        if (code === DisconnectReason.loggedOut) {
-          // Preserve the invalid session for diagnosis; start a fresh pairing session.
-          // Keep /data/bot-state.json and the persistent volume untouched.
-          try {
-            const backupDir = AUTH_DIR + '.loggedout-backup-' + Date.now();
-            if (fs.existsSync(AUTH_DIR)) fs.renameSync(AUTH_DIR, backupDir);
-            fs.mkdirSync(AUTH_DIR, { recursive: true });
-            latestQR = '';
-            connectionState = 're-pair-required';
-            logger.warn({ backupDir }, 'Logged-out WhatsApp credentials backed up; a fresh QR will be generated');
-          } catch (e) {
-            logger.error({ err: String(e) }, 'Could not prepare fresh pairing; check /data volume permissions');
-          }
-        }
-        reconnectTimer = setTimeout(() => {
-          starting = false;
-          startBot().catch(err => logger.error({ err: String(err) }, 'Restart failed'));
-        }, 2500);
+        connected = false; latestQR = ''; connectionState = 'disconnected';
+        const code = ld?.error?.output?.statusCode; lastDisconnect = { code: code || null, at: new Date().toISOString() };
+        logger.warn({ code }, 'WhatsApp connection closed');
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (code !== DisconnectReason.loggedOut) reconnectTimer = setTimeout(() => { starting = false; startBot(); }, 3000);
       }
+    });
+    sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
+      try {
+        const gs = groupSettings(id);
+        if (!gs.welcome || action !== 'add') return;
+        for (const p of participants) await sendText(id, '👋 Welcome @' + p.split('@')[0] + '! Please read the group rules.', null).catch(()=>{});
+      } catch (e) { logger.warn({ err:String(e) }, 'Welcome handler failed'); }
     });
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
       for (const msg of messages) {
-        try { await handleMessage(msg); } catch (e) { logger.error({ err: String(e) }, 'Message handler error'); }
+        try {
+          if (!msg.message || msg.key.fromMe) continue;
+          const jid = msg.key.remoteJid;
+          if (!jid || jid === 'status@broadcast') continue;
+          messageCount++; lastMessageAt = new Date().toISOString();
+          const text = getText(msg.message).trim();
+          const isGroup = jid.endsWith('@g.us');
+          let meta = null;
+          if (isGroup) { try { meta = await sock.groupMetadata(jid); } catch {} }
+          if (isGroup && await moderateLink(msg, jid, meta)) continue;
+          if (!text.startsWith(PREFIX)) {
+            if (!isGroup && jid.endsWith('@s.whatsapp.net')) {
+              // Normal private messages are ignored; commands remain available.
+            }
+            continue;
+          }
+          commandCount++;
+          const parts = text.slice(PREFIX.length).trim().split(/\s+/);
+          const cmd = (parts.shift() || '').toLowerCase(), args = parts;
+          const sender = msg.key.participant || jid;
+          const senderIsAdmin = isGroup ? isAdmin(meta, sender) : (OWNER && sender.replace(/\D/g,'').includes(OWNER));
+          const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+          const botIsAdmin = isGroup && isAdmin(meta, botJid);
+          const reply = t => sendText(jid, t, msg);
+          if (cmd === 'ping') await reply('🏓 Pong! NEXBOT Pro is online. Connection: ' + connectionState);
+          else if (cmd === 'help' || cmd === 'menu') await reply('⚡ NEXBOT Pro commands\n' + PREFIX + 'ping — health\n' + PREFIX + 'help — commands\n' + PREFIX + 'rules — group rules\n' + PREFIX + 'groupinfo — group details\n' + PREFIX + 'admins — list admins\n' + PREFIX + 'kick @user — remove member (admin)\n' + PREFIX + 'promote @user / ' + PREFIX + 'demote @user (admin)\n' + PREFIX + 'tagall — mention members (admin)\n' + PREFIX + 'antilink on|off — group setting (admin)\n' + PREFIX + 'antispam on|off — group setting (admin)');
+          else if (cmd === 'rules') await reply('📌 Group rules\n1. Be respectful.\n2. No spam or unsolicited links.\n3. Follow group admin guidance.');
+          else if (cmd === 'groupinfo' && isGroup) await reply('👥 ' + meta.subject + '\nMembers: ' + meta.participants.length + '\nAdmins: ' + meta.participants.filter(p=>p.admin).length);
+          else if (cmd === 'admins' && isGroup) await reply('🛡️ Group admins: ' + meta.participants.filter(p=>p.admin).map(p=>'@'+p.id.split('@')[0]).join(', '));
+          else if (['kick','promote','demote','tagall','antilink','antispam'].includes(cmd)) {
+            if (!isGroup) { await reply('This command only works in groups.'); continue; }
+            if (!senderIsAdmin && sender.replace(/\D/g,'') !== OWNER) { await reply('⛔ Only group admins can use this command.'); continue; }
+            if (!botIsAdmin) { await reply('⚠️ Please make NEXBOT an admin first.'); continue; }
+            const targets = mentionedJids(msg);
+            if (cmd === 'kick' || cmd === 'promote' || cmd === 'demote') {
+              if (!targets.length) { await reply('Mention the member, for example: ' + PREFIX + cmd + ' @member'); continue; }
+              const action = cmd === 'kick' ? 'remove' : cmd;
+              await sock.groupParticipantsUpdate(jid, targets, action);
+              await reply('✅ ' + cmd + ' action completed for ' + targets.length + ' member(s).');
+            } else if (cmd === 'tagall') {
+              const mentions = meta.participants.map(p=>p.id);
+              await sock.sendMessage(jid, { text: '📣 Attention everyone!\n' + mentions.map(x=>'@'+x.split('@')[0]).join(' '), mentions }, { quoted: msg });
+            } else {
+              const value = (args[0] || '').toLowerCase();
+              if (!['on','off'].includes(value)) { await reply('Usage: ' + PREFIX + cmd + ' on|off'); continue; }
+              settings.groups[jid] = { ...groupSettings(jid), [cmd === 'antilink' ? 'antiLink' : 'antiSpam']: value === 'on' };
+              saveState(); await reply('✅ ' + cmd + ' ' + value + ' for this group.');
+            }
+          } else if (cmd === 'status') await reply('NEXBOT Pro: ' + connectionState + '\nMessages: ' + messageCount + '\nCommands: ' + commandCount);
+        } catch (e) { logger.error({ err:String(e) }, 'Message handler failed'); }
       }
     });
-    sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
-      if (action !== 'add' || !groupSettings(id).welcome) return;
-      try {
-        const meta = await sock.groupMetadata(id);
-        for (const user of participants) await sock.sendMessage(id, {
-          text: `👋 Welcome @${jidNumber(user)} to *${meta.subject}*!\nPlease read the group rules and be respectful.`,
-          mentions: [user]
-        });
-      } catch (e) { logger.warn({ err: String(e) }, 'Welcome message failed'); }
-    });
-  } finally {
-    starting = false;
-  }
+  } catch (e) {
+    connectionState = 'error'; lastDisconnect = { error: String(e), at: new Date().toISOString() };
+    logger.error({ err:String(e) }, 'Bot startup failed');
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => { starting = false; startBot(); }, 5000);
+  } finally { starting = false; }
 }
-
-startBot().catch(err => { logger.error({ err: String(err) }, 'Fatal startup error'); process.exit(1); });
+app.listen(PORT, '0.0.0.0', () => { logger.info({ port:PORT }, 'NEXBOT Pro HTTP server listening'); startBot(); });
+process.on('SIGTERM', () => { try { sock?.end(undefined); } catch {} process.exit(0); });
