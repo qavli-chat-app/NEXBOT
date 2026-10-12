@@ -126,7 +126,7 @@ async function startBot() {
       try {
         const gs = groupSettings(id);
         if (!gs.welcome || action !== 'add') return;
-        for (const p of participants) await sendText(id, '👋 Welcome @' + p.split('@')[0] + '! Please read the group rules.', null).catch(()=>{});
+        for (const p of participants) await sock.sendMessage(id, { text: '👋 Welcome @' + p.split('@')[0] + '! Please read the group rules.', mentions: [p] }).catch(()=>{});
       } catch (e) { logger.warn({ err:String(e) }, 'Welcome handler failed'); }
     });
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -182,7 +182,7 @@ async function startBot() {
           else if (cmd === 'admins' && isGroup) await sock.sendMessage(jid,{text:'🛡️ Group admins: ' + meta.participants.filter(p=>p.admin).map(p=>'@'+p.id.split('@')[0]).join(', '),mentions:meta.participants.filter(p=>p.admin).map(p=>p.id)},{quoted:msg});
           else if (cmd === 'status') await reply('NEXBOT Pro: ' + connectionState + '\\nMessages: ' + messageCount + '\\nCommands: ' + commandCount + '\\nUptime: ' + Math.floor((Date.now()-startedAt)/1000) + ' seconds');
           else if (cmd === 'privateprotection') {
-            if (!OWNER || sender.replace(/\\D/g,'') !== OWNER) { await reply('⛔ Owner-only command. Configure BOT_OWNER in Railway variables.'); continue; }
+            if (!OWNER || sender.replace(/\D/g,'') !== OWNER) { await reply('⛔ Owner-only command. Configure BOT_OWNER in Railway variables.'); continue; }
             const value=(args[0]||'').toLowerCase(); if(!['on','off'].includes(value)){await reply('Usage: '+PREFIX+'privateprotection on|off');continue;}
             settings.privateProtection=value==='on'; saveState(); await reply('✅ Private-message protection '+value+'.');
           }
