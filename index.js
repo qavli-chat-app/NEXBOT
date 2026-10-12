@@ -22,14 +22,14 @@ app.use(express.json({ limit: '100kb' }));
 
 let sock = null, latestQR = '', connected = false, connectionState = 'starting';
 let lastDisconnect = null, starting = false, reconnectTimer = null, startedAt = Date.now();
-let settings = { antiLink: true, antiSpam: true, welcome: true, privateProtection: true, groups: {}, warnings: {}, rules: {}, customReplies: {}, blockedWords: {} };
+let settings = { antiLink: true, antiSpam: true, welcome: true, privateProtection: true, groups: {}, warnings: {}, rules: {}, customReplies: {}, blockedWords: {}, managedGroupId: '', textOnly: true, blockPhoneNumbers: true, blockBusinessPromo: true, deleteMedia: true };
 let messageCount = 0, commandCount = 0, lastMessageAt = null;
 const recentMessages = new Map(), privateReplyAt = new Map(), commandCooldown = new Map();
 const cooldown = (key, ms) => { const now=Date.now(), prev=commandCooldown.get(key)||0; if(now-prev<ms) return false; commandCooldown.set(key,now); return true; };
 try {
   if (fs.existsSync(STATE_FILE)) {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {}, warnings: s.settings?.warnings || {}, rules: s.settings?.rules || {}, customReplies: s.settings?.customReplies || {}, blockedWords: s.settings?.blockedWords || {} };
+    settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {}, warnings: s.settings?.warnings || {}, rules: s.settings?.rules || {}, customReplies: s.settings?.customReplies || {}, blockedWords: s.settings?.blockedWords || {}, managedGroupId: s.settings?.managedGroupId || '', textOnly: s.settings?.textOnly !== false, blockPhoneNumbers: s.settings?.blockPhoneNumbers !== false, blockBusinessPromo: s.settings?.blockBusinessPromo !== false, deleteMedia: s.settings?.deleteMedia !== false };
   }
 } catch (e) { logger.warn({ err: String(e) }, 'Could not load saved settings'); }
 function saveState() {
@@ -122,8 +122,9 @@ app.get('/api/qr', auth, async (_req,res) => {
   catch { res.status(500).json({ error:'QR generation failed' }); }
 });
 app.post('/api/settings', auth, (req,res) => {
-  const allowed = ['antiLink','antiSpam','welcome','privateProtection'];
+  const allowed = ['antiLink','antiSpam','welcome','privateProtection','textOnly','blockPhoneNumbers','blockBusinessPromo','deleteMedia'];
   for (const key of allowed) if (typeof req.body?.[key] === 'boolean') settings[key] = req.body[key];
+  if (typeof req.body?.managedGroupId === 'string' && (req.body.managedGroupId === '' || req.body.managedGroupId.endsWith('@g.us'))) settings.managedGroupId = req.body.managedGroupId;
   saveState(); res.json({ ok:true, settings });
 });
 app.get('/dashboard', (_req,res) => res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>NEXBOT Pro</title><style>
@@ -205,6 +206,22 @@ async function startBot() {
           let meta = null;
           if (isGroup) { try { meta = await sock.groupMetadata(jid); } catch {} }
           const sender = msg.key.participant || jid;
+          if (isGroup && settings.managedGroupId && jid !== settings.managedGroupId) continue;
+          if (isGroup && jid === settings.managedGroupId) {
+            const body = msg.message || {};
+            const wrapped = body.ephemeralMessage?.message || body.viewOnceMessage?.message || body.viewOnceMessageV2?.message || body;
+            const mediaKeys = ['imageMessage','videoMessage','audioMessage','documentMessage','stickerMessage','contactMessage','contactsArrayMessage','locationMessage','liveLocationMessage','pollCreationMessage','pollCreationMessageV2','pollCreationMessageV3'];
+            const mediaFound = mediaKeys.some(k => wrapped[k]);
+            const rawText = text || '';
+            const hasPhone = settings.blockPhoneNumbers && /(?:\+?\d[\d .()\-]{7,}\d)/.test(rawText);
+            const hasPromo = settings.blockBusinessPromo && /\b(whatsapp|contact|call|business|service|deal|price|order|subscribe|dm me|inbox me|promo|marketing)\b/i.test(rawText);
+            if ((settings.textOnly && mediaFound) || (settings.antiLink && /https?:\/\/|www\.|chat\.whatsapp\.com\//i.test(rawText)) || hasPhone || hasPromo) {
+              const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+              if (settings.deleteMedia && isAdmin(meta, botJid)) await sock.sendMessage(jid, { delete: msg.key }).catch(() => {});
+              await sendText(jid, '🔒 This group is text-only. Media, links, phone numbers and business promotions are not allowed. Please send a simple text message.', msg).catch(() => {});
+              continue;
+            }
+          }
           if (isGroup) {
             const gs = groupSettings(jid);
             if (gs.antiSpam) {
