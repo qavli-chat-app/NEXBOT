@@ -472,6 +472,30 @@ async function handleMessage(msg) {
       }
     }
   }
+  // Free local auto-reply menu: no paid AI/API key required.
+  if (!isGroup && !text.startsWith(PREFIX)) {
+    const q = text.toLowerCase().replace(/[.!?\\s]+/g, ' ').trim();
+    const menu = [
+      '🤖 *NEXBOT MENU*',
+      '',
+      'Reply with a number or send a command:',
+      '1️⃣ — About NEXBOT',
+      '2️⃣ — Help and commands',
+      '3️⃣ — Contact the group admin',
+      '',
+      'Commands: !menu · !help · !ping',
+      'I use built-in replies; no paid AI service is required.'
+    ].join('\\n');
+    if (['menu','start','hi','hello','salam','assalamualaikum','aoa','hey','1','2','3'].includes(q)) {
+      const replies = {
+        '1': '🤖 *About NEXBOT*\\nI am an automated WhatsApp helper with built-in menu replies and group tools.',
+        '2': '📘 *Help*\\nSend !help to view commands. Send !ping to test if I am online.',
+        '3': '👥 *Contact an admin*\\nPlease contact the group or account administrator directly for support.'
+      };
+      await send(jid, replies[q] || menu);
+      return;
+    }
+  }
   if (false && groupConfig.aiReplies && !text.startsWith(PREFIX)) {
     const q = text.toLowerCase();
     let answer = '';
@@ -498,9 +522,11 @@ async function handleMessage(msg) {
   }
 
   switch (command) {
+    case 'menu': return send(jid, ['🤖 *NEXBOT MENU*', '1️⃣ About NEXBOT', '2️⃣ Help and commands', '3️⃣ Contact the group admin', '', 'Send 1, 2, or 3 in a private chat for details.', PREFIX + 'help — full commands'].join('\\n'));
     case 'help':
       return send(jid, [
         '🤖 *NEXBOT Commands*',
+        PREFIX + 'menu — show the automatic reply menu',
         PREFIX + 'help — show commands',
         PREFIX + 'ping — test response',
         PREFIX + 'groupinfo — group details (admin)',
