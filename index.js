@@ -242,8 +242,12 @@ async function handleMessage(msg) {
     const groupKey = jid + ':' + sender;
     const now = Date.now();
     const recent = (recentMessages.get(groupKey) || []).filter(t => now - t < 10000);
+    recent.push(now);
+    recentMessages.set(groupKey, recent);
     if (groupConfig.antiFlood && recent.length >= 8) {
       try { await sock.sendMessage(jid, { delete: msg.key }); } catch {}
+      await send(jid, '🛡️ Anti-flood: please slow down.');
+      recentMessages.set(groupKey, []);
       return;
     }
     if (groupConfig.antiCaps && text.length >= 12 && text === text.toUpperCase() && /[A-Z]/.test(text)) {
