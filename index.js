@@ -415,20 +415,36 @@ async function startBot() {
           let meta = null;
           if (isGroup) { try { meta = await sock.groupMetadata(jid); } catch {} }
           const sender = msg.key.participant || jid;
-          if (isGroup && settings.managedGroupId && jid !== settings.managedGroupId) continue;
-          if (isGroup && jid === settings.managedGroupId) {
+          if (isGroup) {
+            // Enforce text-only moderation in every group, not just a single selected group.
+            // Baileys can wrap messages in ephemeral/view-once containers.
             const body = msg.message || {};
             const wrapped = body.ephemeralMessage?.message || body.viewOnceMessage?.message || body.viewOnceMessageV2?.message || body;
-            const mediaKeys = ['imageMessage','videoMessage','audioMessage','documentMessage','stickerMessage','contactMessage','contactsArrayMessage','locationMessage','liveLocationMessage','pollCreationMessage','pollCreationMessageV2','pollCreationMessageV3'];
-            const mediaFound = mediaKeys.some(k => wrapped[k]);
-            const rawText = text || '';
+            const metadataKeys = new Set(['messageContextInfo', 'senderKeyDistributionMessage']);
+            const contentKeys = Object.keys(wrapped).filter(k => !metadataKeys.has(k));
+            const hasNonText = contentKeys.some(k => !['conversation', 'extendedTextMessage'].includes(k));
+            const rawText = getText(wrapped).trim();
+            const hasLink = /https?:\/\/|www\.|chat\.whatsapp\.com\//i.test(rawText)
+              || Boolean(wrapped.extendedTextMessage?.contextInfo?.externalAdReply?.sourceUrl);
             const hasPhone = settings.blockPhoneNumbers && /(?:\+?\d[\d .()\-]{7,}\d)/.test(rawText);
-            const hasPromo = settings.blockBusinessPromo && /\b(whatsapp|contact|call|business|service|deal|price|order|subscribe|dm me|inbox me|promo|marketing)\b/i.test(rawText);
-            if ((settings.textOnly && mediaFound) || (settings.antiLink && /https?:\/\/|www\.|chat\.whatsapp\.com\//i.test(rawText)) || hasPhone || hasPromo) {
-              eventStore.add('moderation_action', { category:'strict_filter', outcome:'triggered' });
+            const promoPattern = /\b(?:buy\s+now|order\s+now|dm\s+me|inbox\s+me|contact\s+me|call\s+now|whatsapp\s+me|for\s+sale|limited\s+offer|special\s+offer|discounts?|promo(?:tion)?(?:\s+code)?|marketing\s+services|price\s+list|earn\s+money|investment\s+plan|click\s+here|subscribe\s+now|delivery\s+available|available\s+for\s+order)\b/i;
+            const hasPromo = settings.blockBusinessPromo && promoPattern.test(rawText);
+            const violation = (settings.textOnly && hasNonText) || hasLink || hasPhone || hasPromo;
+            if (violation) {
+              const reason = hasNonText ? 'non-text content' : hasLink ? 'link' : hasPhone ? 'phone number' : 'business promotion';
               const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
-              if (settings.deleteMedia && isAdmin(meta, botJid)) await sock.sendMessage(jid, { delete: msg.key }).catch(() => {});
-              await sendText(jid, '🔒 This group is text-only. Media, links, phone numbers and business promotions are not allowed. Please send a simple text message.', msg).catch(() => {});
+              let deleted = false;
+              if (settings.deleteMedia && isAdmin(meta, botJid)) {
+                try { await sock.sendMessage(jid, { delete: msg.key }); deleted = true; }
+                catch (e) { logger.warn({ err:String(e), groupId:jid }, 'Could not delete a text-only rule violation'); }
+              }
+              const warnings = addWarning(jid, sender, botJid, reason);
+              eventStore.add('moderation_action', {
+                category:'text_only',
+                outcome: deleted ? 'deleted_and_warned' : (isAdmin(meta, botJid) ? 'delete_failed_warned' : 'bot_not_admin_warned')
+              });
+              const warningText = '⚠️ @' + sender.split('@')[0] + ': this group allows text messages only. Media, links, phone numbers and business promotions are not allowed. Warning ' + warnings.length + '.';
+              await sock.sendMessage(jid, { text:warningText, mentions:[sender] }).catch(() => {});
               continue;
             }
           }
