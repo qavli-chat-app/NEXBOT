@@ -1,10 +1,14 @@
-name: Build NEXBOT Android APK
+name: Build and Publish NEXBOT PRO Android APK
 on:
   workflow_dispatch:
   push:
+    branches:
+      - nexbot-pro-rebuild
     paths:
       - 'mobile-apk/**'
       - '.github/workflows/build-nexbot-apk.yml'
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -20,12 +24,27 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Build debug APK
+      - name: Build Android APK
         run: gradle --no-daemon -p mobile-apk assembleDebug
-      - name: Upload APK
+      - name: Verify APK exists
+        run: test -s mobile-apk/app/build/outputs/apk/debug/app-debug.apk
+      - name: Upload APK build artifact
         uses: actions/upload-artifact@v4
         with:
           name: NEXBOT-PRO-Android-APK
           path: mobile-apk/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
+      - name: Publish public APK download
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nexbot-pro-apk-latest
+          name: NEXBOT PRO Android APK — Latest
+          target_commitish: nexbot-pro-rebuild
+          body: |
+            Android installer for the NEXBOT PRO mobile dashboard.
+
+            The WhatsApp bot/backend continues running on the configured Railway service; this APK is the mobile dashboard client. Install only if you trust this project and keep your panel key private.
+          files: mobile-apk/app/build/outputs/apk/debug/app-debug.apk
+          overwrite_files: true
+          make_latest: true
