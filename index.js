@@ -74,14 +74,14 @@ function scheduleReconnect(reason = 'connection closed') {
   }, delay);
   reconnectTimer.unref?.();
 }
-let settings = { antiLink: true, antiSpam: true, welcome: true, privateProtection: true, groups: {}, warnings: {}, rules: {}, customReplies: {}, blockedWords: {}, managedGroupId: '', textOnly: true, blockPhoneNumbers: true, blockBusinessPromo: true, deleteMedia: true };
+let settings = { antiLink: true, antiSpam: true, welcome: true, goodbye: false, privateProtection: true, awayMessage:'I am not accepting private messages. Please do not message me.', welcomeMessage:'👋 Welcome @{{user}}! Please read the group rules.', goodbyeMessage:'Goodbye @{{user}}. Take care!', fallbackReplies:{}, replyCooldownSeconds:3, groups: {}, warnings: {}, rules: {}, customReplies: {}, blockedWords: {}, managedGroupId: '', textOnly: true, blockPhoneNumbers: true, blockBusinessPromo: true, deleteMedia: true };
 let messageCount = 0, commandCount = 0, lastMessageAt = null;
 const recentMessages = new Map(), privateReplyAt = new Map(), commandCooldown = new Map(), processedMessageIds = new Map();
 const cooldown = (key, ms) => { const now=Date.now(), prev=commandCooldown.get(key)||0; if(now-prev<ms) return false; commandCooldown.set(key,now); return true; };
 try {
   if (fs.existsSync(STATE_FILE)) {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {}, warnings: s.settings?.warnings || {}, rules: s.settings?.rules || {}, customReplies: s.settings?.customReplies || {}, blockedWords: s.settings?.blockedWords || {}, managedGroupId: s.settings?.managedGroupId || '', textOnly: s.settings?.textOnly !== false, blockPhoneNumbers: s.settings?.blockPhoneNumbers !== false, blockBusinessPromo: s.settings?.blockBusinessPromo !== false, deleteMedia: s.settings?.deleteMedia !== false };
+    settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {}, warnings: s.settings?.warnings || {}, rules: s.settings?.rules || {}, customReplies: s.settings?.customReplies || {}, fallbackReplies: s.settings?.fallbackReplies || {}, blockedWords: s.settings?.blockedWords || {}, managedGroupId: s.settings?.managedGroupId || '', awayMessage: typeof s.settings?.awayMessage === 'string' ? s.settings.awayMessage : settings.awayMessage, welcomeMessage: typeof s.settings?.welcomeMessage === 'string' ? s.settings.welcomeMessage : settings.welcomeMessage, goodbyeMessage: typeof s.settings?.goodbyeMessage === 'string' ? s.settings.goodbyeMessage : settings.goodbyeMessage, replyCooldownSeconds: Number.isInteger(s.settings?.replyCooldownSeconds) ? Math.min(60, Math.max(1, s.settings.replyCooldownSeconds)) : settings.replyCooldownSeconds, goodbye: s.settings?.goodbye === true, textOnly: s.settings?.textOnly !== false, blockPhoneNumbers: s.settings?.blockPhoneNumbers !== false, blockBusinessPromo: s.settings?.blockBusinessPromo !== false, deleteMedia: s.settings?.deleteMedia !== false };
   }
 } catch (e) { logger.warn({ err: String(e) }, 'Could not load saved settings'); }
 function saveState() {
@@ -194,6 +194,24 @@ app.delete('/api/replies', auth, (req,res) => {
   eventStore.add('auto_reply_deleted', { category:'group' });
   res.json({ ok:true });
 });
+app.get('/api/reply-settings', auth, (req,res) => {
+  const groupId = typeof req.query.groupId === 'string' ? req.query.groupId : '';
+  if (!groupId.endsWith('@g.us')) return res.status(400).json({ error:'Select a valid group.' });
+  res.json({ groupId, fallbackReply:settings.fallbackReplies?.[groupId] || '', replyCooldownSeconds:settings.replyCooldownSeconds || 3, exactReplyCount:Object.keys(settings.customReplies[groupId] || {}).length });
+});
+app.post('/api/reply-settings', auth, (req,res) => {
+  const { groupId, fallbackReply, replyCooldownSeconds } = req.body || {};
+  if (typeof groupId !== 'string' || !groupId.endsWith('@g.us')) return res.status(400).json({ error:'Select a valid group.' });
+  if (typeof fallbackReply !== 'string' || fallbackReply.length > 1000) return res.status(400).json({ error:'Fallback reply must be 0–1000 characters.' });
+  if (replyCooldownSeconds !== undefined && (!Number.isInteger(replyCooldownSeconds) || replyCooldownSeconds < 1 || replyCooldownSeconds > 60)) return res.status(400).json({ error:'Reply cooldown must be 1–60 seconds.' });
+  settings.fallbackReplies = settings.fallbackReplies || {};
+  if (fallbackReply.trim()) settings.fallbackReplies[groupId] = fallbackReply.trim();
+  else delete settings.fallbackReplies[groupId];
+  if (replyCooldownSeconds !== undefined) settings.replyCooldownSeconds = replyCooldownSeconds;
+  saveState();
+  eventStore.add('fallback_reply_saved', { category:'group', outcome:fallbackReply.trim() ? 'enabled' : 'disabled' });
+  res.json({ ok:true, groupId, fallbackReply:settings.fallbackReplies[groupId] || '', replyCooldownSeconds:settings.replyCooldownSeconds });
+});
 app.get('/api/workflows', auth, (_req,res) => res.json({ workflows:workflowEngine.list(), webhookAllowlistConfigured:webhookAllowlist.length > 0 }));
 app.post('/api/workflows', auth, (req,res) => {
   const result = workflowEngine.save(req.body?.workflow || req.body);
@@ -296,14 +314,16 @@ app.get('/api/qr', auth, async (_req,res) => {
   catch { res.status(500).json({ error:'QR generation failed' }); }
 });
 app.post('/api/settings', auth, (req,res) => {
-  const allowed = ['antiLink','antiSpam','welcome','privateProtection','textOnly','blockPhoneNumbers','blockBusinessPromo','deleteMedia'];
+  const allowed = ['antiLink','antiSpam','welcome','goodbye','privateProtection','textOnly','blockPhoneNumbers','blockBusinessPromo','deleteMedia'];
   for (const key of allowed) if (typeof req.body?.[key] === 'boolean') settings[key] = req.body[key];
+  for (const key of ['awayMessage','welcomeMessage','goodbyeMessage']) if (typeof req.body?.[key] === 'string' && req.body[key].length <= 1000) settings[key] = req.body[key].trim();
+  if (Number.isInteger(req.body?.replyCooldownSeconds) && req.body.replyCooldownSeconds >= 1 && req.body.replyCooldownSeconds <= 60) settings.replyCooldownSeconds = req.body.replyCooldownSeconds;
   if (typeof req.body?.managedGroupId === 'string' && (req.body.managedGroupId === '' || req.body.managedGroupId.endsWith('@g.us'))) settings.managedGroupId = req.body.managedGroupId;
   saveState(); res.json({ ok:true, settings });
 });
 app.get('/dashboard', (_req,res) => res.sendFile(path.join(process.cwd(), 'dashboard.html')));
 
-const groupDefaults = { antiLink: settings.antiLink, antiSpam: settings.antiSpam, welcome: settings.welcome };
+const groupDefaults = { antiLink: settings.antiLink, antiSpam: settings.antiSpam, welcome: settings.welcome, goodbye:settings.goodbye };
 function groupSettings(id) { return { ...groupDefaults, ...(settings.groups[id] || {}) }; }
 function warnKey(groupId, userId) { return groupId + '|' + userId; }
 function getWarnings(groupId,userId) { return settings.warnings[warnKey(groupId,userId)] || []; }
@@ -362,8 +382,13 @@ async function startBot() {
     sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
       try {
         const gs = groupSettings(id);
-        if (!gs.welcome || action !== 'add') return;
-        for (const p of participants) await sock.sendMessage(id, { text: '👋 Welcome @' + p.split('@')[0] + '! Please read the group rules.', mentions: [p] }).catch(()=>{});
+        if (!((action === 'add' && gs.welcome) || (action === 'remove' && settings.goodbye))) return;
+        for (const p of participants) {
+          const template = action === 'add' ? settings.welcomeMessage : settings.goodbyeMessage;
+          const text = String(template || '').replaceAll('{{user}}', p.split('@')[0]).replaceAll('{{group}}', id);
+          if (!text.trim()) continue;
+          await sock.sendMessage(id, { text, mentions: [p] }).then(() => eventStore.add(action === 'add' ? 'welcome_sent' : 'goodbye_sent', { category:'group', outcome:'success' })).catch(() => eventStore.add(action === 'add' ? 'welcome_sent' : 'goodbye_sent', { category:'group', outcome:'failed' }));
+        }
       } catch (e) { logger.warn({ err:String(e) }, 'Welcome handler failed'); }
     });
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -436,7 +461,7 @@ async function startBot() {
             const now=Date.now(), last=privateReplyAt.get(sender)||0;
             if (now-last > 24*60*60*1000) {
               privateReplyAt.set(sender,now);
-              await sendText(jid,'I am not accepting private messages. Please do not message me.',msg).catch(()=>{});
+              await sendText(jid, settings.awayMessage || 'I am not accepting private messages. Please do not message me.', msg).catch(()=>{});
             }
             continue;
           }
@@ -445,8 +470,14 @@ async function startBot() {
             if (workflowHandled) continue;
             if (isGroup && text) {
               const replies = settings.customReplies[jid] || {};
-              const answer = replies[text.toLowerCase().trim()];
-              if (answer && cooldown('custom:' + jid + ':' + sender, 3000)) await sendText(jid, answer, msg).catch(() => {});
+              const normalized = text.toLowerCase().trim();
+              const answer = replies[normalized];
+              const waitMs = (settings.replyCooldownSeconds || 3) * 1000;
+              if (answer && cooldown('custom:' + jid + ':' + sender, waitMs)) {
+                await sendText(jid, answer, msg).catch(() => {});
+              } else if (!answer && settings.fallbackReplies?.[jid] && cooldown('fallback:' + jid + ':' + sender, waitMs)) {
+                await sendText(jid, settings.fallbackReplies[jid], msg).catch(() => {});
+              }
             }
             continue;
           }
