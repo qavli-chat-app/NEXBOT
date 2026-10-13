@@ -22,6 +22,22 @@ app.use(express.json({ limit: '100kb' }));
 
 let sock = null, latestQR = '', connected = false, connectionState = 'starting';
 let lastDisconnect = null, starting = false, reconnectTimer = null, startedAt = Date.now();
+let reconnectAttempts = 0;
+const RECONNECT_BASE_MS = 3000;
+const RECONNECT_MAX_MS = 60000;
+function scheduleReconnect(reason = 'connection closed') {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectAttempts += 1;
+  const delay = Math.min(RECONNECT_BASE_MS * (2 ** Math.min(reconnectAttempts - 1, 5)), RECONNECT_MAX_MS);
+  connectionState = 'reconnecting';
+  logger.warn({ reason, attempt: reconnectAttempts, delayMs: delay }, 'Scheduling WhatsApp reconnect');
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    starting = false;
+    startBot();
+  }, delay);
+  reconnectTimer.unref?.();
+}
 let settings = { antiLink: true, antiSpam: true, welcome: true, privateProtection: true, groups: {}, warnings: {}, rules: {}, customReplies: {}, blockedWords: {}, managedGroupId: '', textOnly: true, blockPhoneNumbers: true, blockBusinessPromo: true, deleteMedia: true };
 let messageCount = 0, commandCount = 0, lastMessageAt = null;
 const recentMessages = new Map(), privateReplyAt = new Map(), commandCooldown = new Map();
@@ -196,13 +212,18 @@ async function startBot() {
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', ({ connection, qr, lastDisconnect: ld }) => {
       if (qr) { latestQR = qr; connectionState = 'qr'; logger.info('WhatsApp QR available; open protected dashboard to pair.'); }
-      if (connection === 'open') { connected = true; latestQR = ''; connectionState = 'connected'; lastDisconnect = null; logger.info('WhatsApp connected'); }
+      if (connection === 'open') { connected = true; latestQR = ''; connectionState = 'connected'; lastDisconnect = null; reconnectAttempts = 0; logger.info('WhatsApp connected'); }
       if (connection === 'close') {
-        connected = false; latestQR = ''; connectionState = 'disconnected';
-        const code = ld?.error?.output?.statusCode; lastDisconnect = { code: code || null, at: new Date().toISOString() };
-        logger.warn({ code }, 'WhatsApp connection closed');
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        if (code !== DisconnectReason.loggedOut) reconnectTimer = setTimeout(() => { starting = false; startBot(); }, 3000);
+        connected = false; latestQR = ''; sock = null;
+        const code = ld?.error?.output?.statusCode;
+        lastDisconnect = { code: code || null, at: new Date().toISOString() };
+        if (code === DisconnectReason.loggedOut) {
+          connectionState = 'logged_out';
+          logger.error({ code }, 'WhatsApp session logged out; manual re-pairing is required');
+        } else {
+          connectionState = 'disconnected';
+          scheduleReconnect('WhatsApp connection closed');
+        }
       }
     });
     sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
@@ -356,11 +377,25 @@ async function startBot() {
       }
     });
   } catch (e) {
-    connectionState = 'error'; lastDisconnect = { error: String(e), at: new Date().toISOString() };
+    connectionState = 'error'; lastDisconnect = { error: 'Bot startup failed', at: new Date().toISOString() };
     logger.error({ err:String(e) }, 'Bot startup failed');
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(() => { starting = false; startBot(); }, 5000);
+    scheduleReconnect('bot startup failed');
   } finally { starting = false; }
 }
-app.listen(PORT, '0.0.0.0', () => { logger.info({ port:PORT }, 'NEXBOT Pro HTTP server listening'); startBot(); });
-process.on('SIGTERM', () => { try { sock?.end(undefined); } catch {} process.exit(0); });
+const server = app.listen(PORT, '0.0.0.0', () => { logger.info({ port:PORT }, 'NEXBOT Pro HTTP server listening'); startBot(); });
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, 'NEXBOT shutdown requested');
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  connected = false;
+  connectionState = 'stopping';
+  const forceExit = setTimeout(() => process.exit(0), 10000);
+  forceExit.unref?.();
+  try { sock?.end(undefined); } catch (e) { logger.warn({ err:String(e) }, 'WhatsApp socket shutdown warning'); }
+  server.close(() => { clearTimeout(forceExit); process.exit(0); });
+}
+process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+process.on('SIGINT', () => { void shutdown('SIGINT'); });
