@@ -61,6 +61,7 @@ let reconnectAttempts = 0;
 const RECONNECT_BASE_MS = 3000;
 const RECONNECT_MAX_MS = 60000;
 function scheduleReconnect(reason = 'connection closed') {
+  if (shuttingDown) return;
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectAttempts += 1;
   const delay = Math.min(RECONNECT_BASE_MS * (2 ** Math.min(reconnectAttempts - 1, 5)), RECONNECT_MAX_MS);
