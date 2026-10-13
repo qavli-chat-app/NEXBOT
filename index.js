@@ -331,7 +331,7 @@ app.post('/api/group-control/bulk', auth, groupActionLimit, async (req,res) => {
   if (!sock || !connected) return res.status(503).json({ error:'WhatsApp is not connected.' });
   const body = req.body || {};
   const groupIds = Array.isArray(body.groupIds)
-    ? [...new Set(body.groupIds.filter(id => typeof id === 'string' && id.endsWith('@g.us')))].slice(0,20)
+    ? [...new Set(body.groupIds.filter(id => typeof id === 'string'))]
     : [];
   const action = body.action;
   const value = body.value;
@@ -339,7 +339,7 @@ app.post('/api/group-control/bulk', auth, groupActionLimit, async (req,res) => {
     ? [...new Set(body.targetIds.filter(id => typeof id === 'string' && /^\d+@s\.whatsapp\.net$/.test(id)))].slice(0,1)
     : [];
   const allowed = ['promote','demote','announcement','member-messaging','edit-info'];
-  if (!groupIds.length) return res.status(400).json({ error:'Select at least one valid group (maximum 20 per batch).' });
+  if (!groupIds.length || groupIds.length > 20 || groupIds.some(id => !id.endsWith('@g.us'))) return res.status(400).json({ error:'Select 1–20 valid groups per batch.' });
   if (!allowed.includes(action)) return res.status(400).json({ error:'Unsupported bulk action.' });
   if (['promote','demote'].includes(action) && targetIds.length !== 1)
     return res.status(400).json({ error:'Select exactly one member from the current group before using a bulk role action.' });
