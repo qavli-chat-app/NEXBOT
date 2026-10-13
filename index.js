@@ -257,17 +257,25 @@ app.get('/api/groups', auth, async (_req,res) => {
   if (!sock || !connected) return res.status(503).json({ error:'WhatsApp is not connected yet. Pair the account first.', connected:false, groups:[] });
   try {
     const all = await sock.groupFetchAllParticipating();
-    const groups = Object.values(all || {}).map(g => ({
-      id: g.id,
-      subject: g.subject || 'Unnamed group',
-      size: Array.isArray(g.participants) ? g.participants.length : 0,
-      desc: g.desc || '',
-      announce: !!g.announce,
-      restrict: !!g.restrict,
-      isCommunity: !!g.isCommunity,
-      participants: (g.participants || []).map(p => ({ id:p.id, name:p.name || p.notify || p.id, admin:p.admin || '' }))
-    })).sort((a,b) => a.subject.localeCompare(b.subject));
-    res.json({ connected:true, count:groups.length, groups });
+    const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+    const adminCheckedAt = new Date().toISOString();
+    const groups = Object.values(all || {}).map(g => {
+      const botAdmin = isAdmin(g, botJid);
+      return {
+        id: g.id,
+        subject: g.subject || 'Unnamed group',
+        size: Array.isArray(g.participants) ? g.participants.length : 0,
+        desc: g.desc || '',
+        announce: !!g.announce,
+        restrict: !!g.restrict,
+        isCommunity: !!g.isCommunity,
+        botAdmin,
+        adminStatus: botAdmin ? 'verified_admin' : 'not_admin',
+        adminCheckedAt,
+        participants: (g.participants || []).map(p => ({ id:p.id, name:p.name || p.notify || p.id, admin:p.admin || '' }))
+      };
+    }).sort((a,b) => a.subject.localeCompare(b.subject));
+    res.json({ connected:true, count:groups.length, botJid, adminCheckedAt, groups });
   } catch (e) {
     logger.warn({ err:String(e) }, 'Could not fetch WhatsApp groups');
     res.status(502).json({ error:'Could not load groups from WhatsApp. Refresh and try again.' });
@@ -457,7 +465,7 @@ async function startBot() {
               const warnings = addWarning(jid, sender, botJid, reason);
               eventStore.add('moderation_action', {
                 category:'text_only',
-                outcome: deleted ? 'deleted_and_warned' : (isAdmin(meta, botJid) ? 'delete_failed_warned' : 'bot_not_admin_warned')
+                outcome: deleted ? 'deleted_and_warned' : (!meta ? 'admin_status_unknown_warned' : (isAdmin(meta, botJid) ? 'delete_failed_warned' : 'bot_not_admin_warned'))
               });
               const warningText = '⚠️ @' + sender.split('@')[0] + ': this group allows text messages only. Media, links, phone numbers and business promotions are not allowed. Warning ' + warnings.length + '.';
               await sock.sendMessage(jid, { text:warningText, mentions:[sender] }).catch(() => {});
