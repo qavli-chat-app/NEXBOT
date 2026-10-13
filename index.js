@@ -6,6 +6,7 @@ import path from 'node:path';
 import makeWASocket, {
   useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion
 } from '@whiskeysockets/baileys';
+import { createEventStore } from './lib/event-store.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -17,6 +18,7 @@ const PREFIX = process.env.COMMAND_PREFIX || '!';
 const OWNER = (process.env.BOT_OWNER || '').replace(/\D/g, '');
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 fs.mkdirSync(AUTH_DIR, { recursive: true });
+const eventStore = createEventStore(path.join(DATA_DIR, 'events.ndjson'));
 app.disable('x-powered-by');
 app.use(express.json({ limit: '100kb' }));
 
@@ -69,6 +71,80 @@ const requireCrypto = { timingSafeEqual: timingEqual };
 const esc = (s='') => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 app.get('/health', (_req,res) => res.json({ ok:true, service:'NEXBOT Pro', state:connectionState, connected, uptimeSeconds:Math.floor((Date.now()-startedAt)/1000), messageCount, commandCount, lastMessageAt, lastDisconnect }));
 app.get('/api/status', auth, (_req,res) => res.json({ service:'NEXBOT Pro', state:connectionState, connected, qrAvailable:!!latestQR, uptimeSeconds:Math.floor((Date.now()-startedAt)/1000), messageCount, commandCount, lastMessageAt, lastDisconnect, settings }));
+app.get('/api/events', auth, (req,res) => {
+  const { type, since, until } = req.query;
+  if ((since && Number.isNaN(Date.parse(since))) || (until && Number.isNaN(Date.parse(until)))) return res.status(400).json({ error:'Invalid date filter. Use ISO date/time.' });
+  try { res.json({ events:eventStore.list({ limit:req.query.limit, type, since, until }) }); }
+  catch (e) { logger.error({ err:String(e) }, 'Could not read event log'); res.status(500).json({ error:'Could not read event log.' }); }
+});
+app.get('/api/analytics', auth, (req,res) => {
+  const { since, until } = req.query;
+  if ((since && Number.isNaN(Date.parse(since))) || (until && Number.isNaN(Date.parse(until)))) return res.status(400).json({ error:'Invalid date filter. Use ISO date/time.' });
+  try { res.json({ ...eventStore.summary({ since, until }), processStartedAt:new Date(startedAt).toISOString(), messageCount, commandCount, lastMessageAt }); }
+  catch (e) { logger.error({ err:String(e) }, 'Could not summarize events'); res.status(500).json({ error:'Could not summarize event log.' }); }
+});
+app.get('/api/commands', auth, (_req,res) => res.json({ prefix:PREFIX, commands:[
+  {name:'ping',description:'Check bot responsiveness',usage:PREFIX+'ping',permission:'Everyone',enabled:true},
+  {name:'help',description:'Show the supported command menu',usage:PREFIX+'help',permission:'Everyone',enabled:true},
+  {name:'menu',description:'Alias for help',usage:PREFIX+'menu',permission:'Everyone',enabled:true},
+  {name:'status',description:'Show live connection and process counters',usage:PREFIX+'status',permission:'Everyone',enabled:true},
+  {name:'rules',description:'Show group rules or default safety guidance',usage:PREFIX+'rules',permission:'Everyone',enabled:true},
+  {name:'groupinfo',description:'Show metadata for the current group',usage:PREFIX+'groupinfo',permission:'Group members',enabled:true},
+  {name:'admins',description:'List current group admins',usage:PREFIX+'admins',permission:'Group members',enabled:true},
+  {name:'addreply',description:'Save a trigger and reply in the current group',usage:PREFIX+'addreply trigger | response',permission:'Group admins',enabled:true},
+  {name:'delreply',description:'Remove a saved reply trigger',usage:PREFIX+'delreply trigger',permission:'Group admins',enabled:true},
+  {name:'replies',description:'List saved reply triggers',usage:PREFIX+'replies',permission:'Group members',enabled:true},
+  {name:'antilink',description:'Toggle link moderation for this group',usage:PREFIX+'antilink on|off',permission:'Group admins',enabled:true},
+  {name:'antispam',description:'Toggle anti-spam for this group',usage:PREFIX+'antispam on|off',permission:'Group admins',enabled:true},
+  {name:'welcome',description:'Toggle group welcome messages',usage:PREFIX+'welcome on|off',permission:'Group admins',enabled:true},
+  {name:'warn',description:'Add a warning to a mentioned member',usage:PREFIX+'warn @member [reason]',permission:'Group admins',enabled:true},
+  {name:'warnings',description:'View warning history for a member',usage:PREFIX+'warnings @member',permission:'Group admins',enabled:true},
+  {name:'clearwarn',description:'Clear warning history for a member',usage:PREFIX+'clearwarn @member',permission:'Group admins',enabled:true},
+  {name:'kick',description:'Remove a member when WhatsApp permissions allow',usage:PREFIX+'kick @member',permission:'Group admins + bot admin',enabled:true},
+  {name:'promote',description:'Promote a group member',usage:PREFIX+'promote @member',permission:'Group admins + bot admin',enabled:true},
+  {name:'demote',description:'Demote a group admin',usage:PREFIX+'demote @member',permission:'Group admins + bot admin',enabled:true},
+  {name:'tagall',description:'Mention group participants',usage:PREFIX+'tagall',permission:'Group admins + bot admin',enabled:true},
+  {name:'setrules',description:'Save group rules',usage:PREFIX+'setrules [text]',permission:'Group admins',enabled:true},
+  {name:'subject',description:'Update group subject',usage:PREFIX+'subject [name]',permission:'Group admins + bot admin',enabled:true},
+  {name:'description',description:'Update group description',usage:PREFIX+'description [text]',permission:'Group admins + bot admin',enabled:true},
+  {name:'badword',description:'Add or remove a blocked word',usage:PREFIX+'badword add|remove word',permission:'Group admins',enabled:true},
+  {name:'badwords',description:'List blocked words',usage:PREFIX+'badwords',permission:'Group admins',enabled:true},
+  {name:'privateprotection',description:'Toggle private-message protection',usage:PREFIX+'privateprotection on|off',permission:'Owner',enabled:true},
+  {name:'ai',description:'Ask the configured optional AI provider',usage:PREFIX+'ai [question]',permission:'Everyone; provider configuration required',enabled:true}
+] }));
+app.get('/api/ai/status', auth, (_req,res) => res.json({ configured:!!process.env.OPENROUTER_API_KEY, provider:'OpenRouter', model:process.env.AI_MODEL || 'openrouter/auto', note:process.env.OPENROUTER_API_KEY ? 'AI provider key is configured; provider limits or charges may apply.' : 'AI is unavailable until an optional provider key is configured.' }));
+app.post('/api/reconnect', auth, (_req,res) => {
+  if (connected) return res.status(409).json({ error:'WhatsApp is already connected.', state:connectionState });
+  if (connectionState === 'logged_out') return res.status(409).json({ error:'WhatsApp session is logged out. Re-pairing is required; existing auth data has not been deleted. Follow the documented recovery steps before changing session files.', state:connectionState });
+  scheduleReconnect('manual dashboard retry');
+  res.status(202).json({ ok:true, state:connectionState, message:'Reconnect scheduled with backoff.' });
+});
+app.get('/api/replies', auth, (req,res) => {
+  const groupId = typeof req.query.groupId === 'string' ? req.query.groupId : '';
+  if (groupId && !groupId.endsWith('@g.us')) return res.status(400).json({ error:'Invalid group ID.' });
+  const source = groupId ? (settings.customReplies[groupId] || {}) : {};
+  res.json({ groupId, replies:Object.entries(source).map(([trigger,response]) => ({ trigger,response })) });
+});
+app.post('/api/replies', auth, (req,res) => {
+  const { groupId, trigger, response } = req.body || {};
+  if (typeof groupId !== 'string' || !groupId.endsWith('@g.us')) return res.status(400).json({ error:'Select a valid group first.' });
+  if (typeof trigger !== 'string' || !trigger.trim() || trigger.trim().length > 60) return res.status(400).json({ error:'Trigger must contain 1–60 characters.' });
+  if (typeof response !== 'string' || !response.trim() || response.trim().length > 1000) return res.status(400).json({ error:'Reply must contain 1–1000 characters.' });
+  settings.customReplies[groupId] = settings.customReplies[groupId] || {};
+  settings.customReplies[groupId][trigger.trim().toLowerCase()] = response.trim();
+  saveState();
+  eventStore.add('auto_reply_saved', { category:'group' });
+  res.json({ ok:true, trigger:trigger.trim().toLowerCase() });
+});
+app.delete('/api/replies', auth, (req,res) => {
+  const { groupId, trigger } = req.body || {};
+  if (typeof groupId !== 'string' || !groupId.endsWith('@g.us') || typeof trigger !== 'string') return res.status(400).json({ error:'Valid groupId and trigger are required.' });
+  if (!settings.customReplies[groupId]?.[trigger]) return res.status(404).json({ error:'Reply trigger not found.' });
+  delete settings.customReplies[groupId][trigger];
+  saveState();
+  eventStore.add('auto_reply_deleted', { category:'group' });
+  res.json({ ok:true });
+});
 app.get('/api/groups', auth, async (_req,res) => {
   if (!sock || !connected) return res.status(503).json({ error:'WhatsApp is not connected yet. Pair the account first.', connected:false, groups:[] });
   try {
@@ -125,8 +201,10 @@ app.post('/api/group-control', auth, async (req,res) => {
       const method = action === 'promote' ? 'promote' : action === 'demote' ? 'demote' : 'remove';
       await sock.groupParticipantsUpdate(groupId, ids, method);
     }
+    eventStore.add('group_action_succeeded', { category:action, outcome:'success' });
     res.json(result);
   } catch (e) {
+    eventStore.add('group_action_failed', { category:action, outcome:'failed' });
     logger.warn({ err:String(e), action, groupId }, 'Group control action failed');
     res.status(502).json({ error:'WhatsApp rejected this action or the operation failed. Check bot admin rights and group permissions.' });
   }
@@ -187,7 +265,12 @@ function mentionedJids(msg) {
   const ctx = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo || {};
   return ctx.mentionedJid || [];
 }
-async function sendText(jid, text, quoted) { if (sock && connected) return sock.sendMessage(jid, { text }, quoted ? { quoted } : {}); }
+async function sendText(jid, text, quoted) {
+  if (!sock || !connected) return;
+  const result = await sock.sendMessage(jid, { text }, quoted ? { quoted } : {});
+  eventStore.add('reply_sent', { category:jid.endsWith('@g.us') ? 'group' : 'private', outcome:'success' });
+  return result;
+}
 async function moderateLink(msg, groupId, meta) {
   const text = getText(msg.message);
   const gs = groupSettings(groupId);
@@ -211,12 +294,13 @@ async function startBot() {
     sock = makeWASocket({ version, auth: state, logger: logger.child({ module:'baileys' }), printQRInTerminal:false, browser:['NEXBOT Pro','Chrome','1.0.0'], markOnlineOnConnect:false, syncFullHistory:false, connectTimeoutMs:60000, defaultQueryTimeoutMs:60000 });
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', ({ connection, qr, lastDisconnect: ld }) => {
-      if (qr) { latestQR = qr; connectionState = 'qr'; logger.info('WhatsApp QR available; open protected dashboard to pair.'); }
-      if (connection === 'open') { connected = true; latestQR = ''; connectionState = 'connected'; lastDisconnect = null; reconnectAttempts = 0; logger.info('WhatsApp connected'); }
+      if (qr) { latestQR = qr; connectionState = 'qr'; eventStore.add('connection_changed', { state:'qr_required' }); logger.info('WhatsApp QR available; open protected dashboard to pair.'); }
+      if (connection === 'open') { connected = true; latestQR = ''; connectionState = 'connected'; lastDisconnect = null; reconnectAttempts = 0; eventStore.add('connection_changed', { state:'connected' }); logger.info('WhatsApp connected'); }
       if (connection === 'close') {
         connected = false; latestQR = ''; sock = null;
         const code = ld?.error?.output?.statusCode;
         lastDisconnect = { code: code || null, at: new Date().toISOString() };
+        eventStore.add('connection_changed', { state:code === DisconnectReason.loggedOut ? 'logged_out' : 'disconnected', code:code || 0 });
         if (code === DisconnectReason.loggedOut) {
           connectionState = 'logged_out';
           logger.error({ code }, 'WhatsApp session logged out; manual re-pairing is required');
@@ -243,6 +327,7 @@ async function startBot() {
           messageCount++; lastMessageAt = new Date().toISOString();
           const text = getText(msg.message).trim();
           const isGroup = jid.endsWith('@g.us');
+          eventStore.add('message_received', { category:isGroup ? 'group' : 'private' });
           let meta = null;
           if (isGroup) { try { meta = await sock.groupMetadata(jid); } catch {} }
           const sender = msg.key.participant || jid;
@@ -304,6 +389,7 @@ async function startBot() {
           commandCount++;
           const parts = text.slice(PREFIX.length).trim().split(/\s+/);
           const cmd = (parts.shift() || '').toLowerCase(), args = parts;
+          eventStore.add('command_received', { command:cmd || '(empty)' });
           const senderIsAdmin = isGroup ? isAdmin(meta, sender) : (OWNER && sender.replace(/\D/g,'').includes(OWNER));
           const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
           const botIsAdmin = isGroup && isAdmin(meta, botJid);
@@ -378,6 +464,7 @@ async function startBot() {
     });
   } catch (e) {
     connectionState = 'error'; lastDisconnect = { error: 'Bot startup failed', at: new Date().toISOString() };
+    eventStore.add('connection_error', { category:'startup' });
     logger.error({ err:String(e) }, 'Bot startup failed');
     scheduleReconnect('bot startup failed');
   } finally { starting = false; }
