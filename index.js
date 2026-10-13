@@ -7,6 +7,7 @@ import makeWASocket, {
   useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion
 } from '@whiskeysockets/baileys';
 import { createEventStore } from './lib/event-store.js';
+import { createWorkflowEngine } from './lib/workflow-engine.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -19,8 +20,40 @@ const OWNER = (process.env.BOT_OWNER || '').replace(/\D/g, '');
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 fs.mkdirSync(AUTH_DIR, { recursive: true });
 const eventStore = createEventStore(path.join(DATA_DIR, 'events.ndjson'));
+const webhookAllowlist = (process.env.WORKFLOW_WEBHOOK_ALLOWLIST || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+const workflowEngine = createWorkflowEngine({
+  filePath:path.join(DATA_DIR, 'workflows.json'), eventStore, webhookAllowlist,
+  sendText:async (context, text) => sendText(context.jid, text, context.quoted),
+  aiResponder:async (prompt, question) => {
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) throw new Error('Optional AI provider is not configured.');
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method:'POST', headers:{ Authorization:'Bearer ' + apiKey, 'Content-Type':'application/json' },
+      body:JSON.stringify({ model:process.env.AI_MODEL || 'openrouter/auto', messages:[{role:'system',content:prompt},{role:'user',content:question}], max_tokens:500 }),
+      signal:AbortSignal.timeout(15000)
+    });
+    if (!response.ok) throw new Error('AI provider returned HTTP ' + response.status);
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || '';
+  }
+});
 app.disable('x-powered-by');
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '100kb' }));
+function makeRateLimiter({ windowMs = 60000, max = 180 } = {}) {
+  const buckets = new Map();
+  return (req, res, next) => {
+    const now = Date.now(), key = req.ip || req.socket.remoteAddress || 'unknown';
+    let bucket = buckets.get(key);
+    if (!bucket || now - bucket.start >= windowMs) { bucket = { start:now, count:0 }; buckets.set(key,bucket); }
+    bucket.count++;
+    if (buckets.size > 5000) for (const [k,v] of buckets) if (now-v.start >= windowMs) buckets.delete(k);
+    if (bucket.count > max) return res.status(429).json({ error:'Too many requests. Wait a minute and try again.' });
+    next();
+  };
+}
+app.use('/api', makeRateLimiter());
+const groupActionLimit = makeRateLimiter({ max:30 });
 
 let sock = null, latestQR = '', connected = false, connectionState = 'starting';
 let lastDisconnect = null, starting = false, reconnectTimer = null, startedAt = Date.now();
@@ -145,6 +178,37 @@ app.delete('/api/replies', auth, (req,res) => {
   eventStore.add('auto_reply_deleted', { category:'group' });
   res.json({ ok:true });
 });
+app.get('/api/workflows', auth, (_req,res) => res.json({ workflows:workflowEngine.list(), webhookAllowlistConfigured:webhookAllowlist.length > 0 }));
+app.post('/api/workflows', auth, (req,res) => {
+  const result = workflowEngine.save(req.body?.workflow || req.body);
+  if (!result.ok) return res.status(400).json({ error:'Workflow validation failed.', errors:result.errors });
+  res.json(result);
+});
+app.patch('/api/workflows/:id', auth, (req,res) => {
+  if (typeof req.body?.enabled !== 'boolean') return res.status(400).json({ error:'enabled must be true or false.' });
+  const current = workflowEngine.list().find(w => w.id === req.params.id);
+  if (!current) return res.status(404).json({ error:'Workflow not found.' });
+  const result = workflowEngine.save({ ...current, enabled:req.body.enabled });
+  if (!result.ok) return res.status(400).json({ error:'Workflow validation failed.', errors:result.errors });
+  eventStore.add('workflow_toggled', { outcome:req.body.enabled ? 'enabled' : 'paused' });
+  res.json(result);
+});
+app.delete('/api/workflows/:id', auth, (req,res) => {
+  if (!workflowEngine.remove(req.params.id)) return res.status(404).json({ error:'Workflow not found.' });
+  res.json({ ok:true });
+});
+app.post('/api/workflows/:id/test', auth, async (req,res) => {
+  const text = typeof req.body?.text === 'string' ? req.body.text.slice(0,2000) : '';
+  const groupId = typeof req.body?.groupId === 'string' ? req.body.groupId : '';
+  if (groupId && !groupId.endsWith('@g.us')) return res.status(400).json({ error:'Invalid group ID.' });
+  const result = await workflowEngine.test(req.params.id, { jid:groupId || 'test@s.whatsapp.net', sender:typeof req.body?.sender === 'string' ? req.body.sender.slice(0,80) : 'test@s.whatsapp.net', text, isGroup:groupId.endsWith('@g.us'), groupName:'Test group', receivedAt:new Date().toISOString() });
+  if (!result.ok) return res.status(400).json(result);
+  res.json({ ...result, dryRun:true, message:'Test mode does not send WhatsApp messages or call external webhooks.' });
+});
+app.get('/api/backup', auth, (_req,res) => {
+  res.set('Content-Disposition', 'attachment; filename="nexbot-settings-backup.json"');
+  res.json({ format:'nexbot-settings-backup-v1', createdAt:new Date().toISOString(), settings, workflows:workflowEngine.list() });
+});
 app.get('/api/groups', auth, async (_req,res) => {
   if (!sock || !connected) return res.status(503).json({ error:'WhatsApp is not connected yet. Pair the account first.', connected:false, groups:[] });
   try {
@@ -165,7 +229,7 @@ app.get('/api/groups', auth, async (_req,res) => {
     res.status(502).json({ error:'Could not load groups from WhatsApp. Refresh and try again.' });
   }
 });
-app.post('/api/group-control', auth, async (req,res) => {
+app.post('/api/group-control', auth, groupActionLimit, async (req,res) => {
   if (!sock || !connected) return res.status(503).json({ error:'WhatsApp is not connected.' });
   const { groupId, action, value, targetIds } = req.body || {};
   if (typeof groupId !== 'string' || !groupId.endsWith('@g.us')) return res.status(400).json({ error:'Select a valid group first.' });
@@ -379,6 +443,8 @@ async function startBot() {
             continue;
           }
           if (!text.startsWith(PREFIX)) {
+            const workflowHandled = await workflowEngine.runForMessage({ jid, sender, text, isGroup, groupName:meta?.subject || '', receivedAt:new Date().toISOString(), quoted:msg });
+            if (workflowHandled) continue;
             if (isGroup && text) {
               const replies = settings.customReplies[jid] || {};
               const answer = replies[text.toLowerCase().trim()];
