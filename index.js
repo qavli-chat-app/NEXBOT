@@ -8,6 +8,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import { createEventStore } from './lib/event-store.js';
 import { createWorkflowEngine } from './lib/workflow-engine.js';
+import { hasUrlLikeContent, hasBusinessPromotion, isGroupAdmin, getAdminVerification } from './lib/moderation.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -260,7 +261,8 @@ app.get('/api/groups', auth, async (_req,res) => {
     const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
     const adminCheckedAt = new Date().toISOString();
     const groups = Object.values(all || {}).map(g => {
-      const botAdmin = isAdmin(g, botJid);
+      const adminStatus = getAdminVerification(g, botJid);
+      const botAdmin = adminStatus === 'verified_admin';
       return {
         id: g.id,
         subject: g.subject || 'Unnamed group',
@@ -270,7 +272,7 @@ app.get('/api/groups', auth, async (_req,res) => {
         restrict: !!g.restrict,
         isCommunity: !!g.isCommunity,
         botAdmin,
-        adminStatus: botAdmin ? 'verified_admin' : 'not_admin',
+        adminStatus,
         adminCheckedAt,
         participants: (g.participants || []).map(p => ({ id:p.id, name:p.name || p.notify || p.id, admin:p.admin || '' }))
       };
@@ -353,7 +355,7 @@ function warnKey(groupId, userId) { return groupId + '|' + userId; }
 function getWarnings(groupId,userId) { return settings.warnings[warnKey(groupId,userId)] || []; }
 function addWarning(groupId,userId,by,reason) { const k=warnKey(groupId,userId); const arr=getWarnings(groupId,userId); arr.push({by,reason:reason||'No reason provided',at:new Date().toISOString()}); settings.warnings[k]=arr.slice(-20); saveState(); return settings.warnings[k]; }
 function parseTargets(msg) { return [...new Set([...mentionedJids(msg), ...(msg.message?.extendedTextMessage?.contextInfo?.participant ? [msg.message.extendedTextMessage.contextInfo.participant] : [])])]; }
-function isAdmin(meta, jid) { return meta?.participants?.some(p => p.id === jid && (p.admin === 'admin' || p.admin === 'superadmin')); }
+function isAdmin(meta, jid) { return isGroupAdmin(meta, jid); }
 function mentionedJids(msg) {
   const ctx = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo || {};
   return ctx.mentionedJid || [];
@@ -448,11 +450,10 @@ async function startBot() {
             const contentKeys = Object.keys(wrapped).filter(k => !metadataKeys.has(k));
             const hasNonText = contentKeys.some(k => !['conversation', 'extendedTextMessage'].includes(k));
             const rawText = getText(wrapped).trim();
-            const hasLink = /https?:\/\/|www\.|chat\.whatsapp\.com\//i.test(rawText)
+            const hasLink = hasUrlLikeContent(rawText)
               || Boolean(wrapped.extendedTextMessage?.contextInfo?.externalAdReply?.sourceUrl);
             const hasPhone = settings.blockPhoneNumbers && /(?:\+?\d[\d .()\-]{7,}\d)/.test(rawText);
-            const promoPattern = /\b(?:buy\s+now|order\s+now|dm\s+me|inbox\s+me|contact\s+me|call\s+now|whatsapp\s+me|for\s+sale|limited\s+offer|special\s+offer|discounts?|promo(?:tion)?(?:\s+code)?|marketing\s+services|price\s+list|earn\s+money|investment\s+plan|click\s+here|subscribe\s+now|delivery\s+available|available\s+for\s+order)\b/i;
-            const hasPromo = settings.blockBusinessPromo && promoPattern.test(rawText);
+            const hasPromo = settings.blockBusinessPromo && hasBusinessPromotion(rawText);
             const violation = (settings.textOnly && hasNonText) || hasLink || hasPhone || hasPromo;
             if (violation) {
               const reason = hasNonText ? 'non-text content' : hasLink ? 'link' : hasPhone ? 'phone number' : 'business promotion';
