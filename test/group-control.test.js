@@ -16,3 +16,15 @@ test('bulk group control is bounded and checks admin and target membership per g
   assert.match(endpoint, /groupParticipantsUpdate\(groupId, \[target\], action\)/);
   assert.match(endpoint, /group_action_failed/);
 });
+
+
+test('admin verification accepts session JID candidates and device-suffixed JIDs', async () => {
+  const source = await import('../lib/moderation.js');
+  const meta = { participants: [
+    { id:'12345:7@s.whatsapp.net', admin:'admin' },
+    { id:'67890@s.whatsapp.net', admin:null }
+  ] };
+  assert.equal(source.isGroupAdmin(meta, ['99999@s.whatsapp.net','12345@s.whatsapp.net']), true);
+  assert.equal(source.getAdminVerification(meta, ['12345:2@s.whatsapp.net']), 'verified_admin');
+  assert.equal(source.getAdminVerification(meta, '67890@s.whatsapp.net'), 'not_admin');
+});
