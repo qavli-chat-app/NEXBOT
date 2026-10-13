@@ -9,6 +9,10 @@ on:
       - '.github/workflows/nexbot-android-apk.yml'
   workflow_dispatch:
 
+concurrency:
+  group: nexbot-android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -37,6 +41,9 @@ jobs:
         working-directory: android-dashboard
         run: gradle --no-daemon assembleDebug
 
+      - name: Rename APK for direct download
+        run: cp android-dashboard/app/build/outputs/apk/debug/app-debug.apk NEXBOT-PRO-dashboard.apk
+
       - name: Publish direct APK download
         uses: softprops/action-gh-release@v2
         with:
@@ -49,4 +56,4 @@ jobs:
           prerelease: true
           make_latest: false
           overwrite_files: true
-          files: android-dashboard/app/build/outputs/apk/debug/app-debug.apk
+          files: NEXBOT-PRO-dashboard.apk
