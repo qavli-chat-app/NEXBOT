@@ -1,0 +1,52 @@
+name: Build NEXBOT PRO Android APK
+
+on:
+  push:
+    branches:
+      - nexbot-android-dashboard
+    paths:
+      - 'android-dashboard/**'
+      - '.github/workflows/nexbot-android-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build installable debug APK
+        working-directory: android-dashboard
+        run: gradle --no-daemon assembleDebug
+
+      - name: Publish direct APK download
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nexbot-android-latest
+          name: NEXBOT PRO Android Dashboard (Latest)
+          body: |
+            Installable Android dashboard app for NEXBOT PRO.
+            The WhatsApp moderation bot continues running on Railway.
+            This is a debug-signed APK for direct installation, not a Play Store release.
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          files: android-dashboard/app/build/outputs/apk/debug/app-debug.apk
