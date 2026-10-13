@@ -327,6 +327,72 @@ app.post('/api/group-control', auth, groupActionLimit, async (req,res) => {
     res.status(502).json({ error:'WhatsApp rejected this action or the operation failed. Check bot admin rights and group permissions.' });
   }
 });
+app.post('/api/group-control/bulk', auth, groupActionLimit, async (req,res) => {
+  if (!sock || !connected) return res.status(503).json({ error:'WhatsApp is not connected.' });
+  const body = req.body || {};
+  const groupIds = Array.isArray(body.groupIds)
+    ? [...new Set(body.groupIds.filter(id => typeof id === 'string' && id.endsWith('@g.us')))].slice(0,20)
+    : [];
+  const action = body.action;
+  const value = body.value;
+  const targetIds = Array.isArray(body.targetIds)
+    ? [...new Set(body.targetIds.filter(id => typeof id === 'string' && /^\d+@s\.whatsapp\.net$/.test(id)))].slice(0,1)
+    : [];
+  const allowed = ['promote','demote','announcement','member-messaging','edit-info'];
+  if (!groupIds.length) return res.status(400).json({ error:'Select at least one valid group (maximum 20 per batch).' });
+  if (!allowed.includes(action)) return res.status(400).json({ error:'Unsupported bulk action.' });
+  if (['promote','demote'].includes(action) && targetIds.length !== 1)
+    return res.status(400).json({ error:'Select exactly one member from the current group before using a bulk role action.' });
+  if (action === 'announcement' && !['on','off'].includes(value)) return res.status(400).json({ error:'For announcement, value must be on or off.' });
+  if (action === 'member-messaging' && !['on','off'].includes(value)) return res.status(400).json({ error:'For member-messaging, value must be on or off.' });
+  if (action === 'edit-info' && !['admins','all'].includes(value)) return res.status(400).json({ error:'For edit-info, value must be admins or all.' });
+  const results = [];
+  for (const groupId of groupIds) {
+    try {
+      const meta = await sock.groupMetadata(groupId);
+      const botId = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+      if (!isAdmin(meta, botId)) {
+        results.push({ groupId, subject:meta.subject || groupId, ok:false, error:'NEXBOT is not a group admin.' });
+        eventStore.add('group_action_failed', { category:'bulk_'+action, outcome:'failed', reason:'bot_not_admin' });
+        continue;
+      }
+      if (action === 'promote' || action === 'demote') {
+        const target = targetIds[0];
+        const participant = (meta.participants || []).find(p => p.id === target);
+        if (!participant) {
+          results.push({ groupId, subject:meta.subject || groupId, ok:false, error:'Selected member is not in this group.' });
+          eventStore.add('group_action_failed', { category:'bulk_'+action, outcome:'failed', reason:'target_not_member' });
+          continue;
+        }
+        if (action === 'promote' && participant.admin) {
+          results.push({ groupId, subject:meta.subject || groupId, ok:true, skipped:true, message:'Member is already an admin.' });
+          continue;
+        }
+        if (action === 'demote' && !participant.admin) {
+          results.push({ groupId, subject:meta.subject || groupId, ok:true, skipped:true, message:'Member is not an admin.' });
+          continue;
+        }
+        await sock.groupParticipantsUpdate(groupId, [target], action);
+      } else if (action === 'announcement') {
+        await sock.groupSettingUpdate(groupId, value === 'on' ? 'announcement' : 'not_announcement');
+      } else if (action === 'member-messaging') {
+        await sock.groupSettingUpdate(groupId, value === 'on' ? 'unlocked' : 'locked');
+      } else if (action === 'edit-info') {
+        await sock.groupSettingUpdate(groupId, value === 'admins' ? 'locked' : 'unlocked');
+      }
+      eventStore.add('group_action_succeeded', { category:'bulk_'+action, outcome:'success' });
+      results.push({ groupId, subject:meta.subject || groupId, ok:true, message:'WhatsApp accepted the action.' });
+    } catch (e) {
+      logger.warn({ err:String(e), action, groupId }, 'Bulk group control action failed');
+      eventStore.add('group_action_failed', { category:'bulk_'+action, outcome:'failed' });
+      results.push({ groupId, ok:false, error:'WhatsApp rejected the action or the operation failed. Verify admin permissions.' });
+    }
+  }
+  const succeeded = results.filter(x => x.ok && !x.skipped).length;
+  const skipped = results.filter(x => x.skipped).length;
+  const failed = results.filter(x => !x.ok).length;
+  res.json({ ok:failed === 0, action, requested:groupIds.length, succeeded, skipped, failed, results });
+});
 app.get('/api/qr', auth, async (_req,res) => {
   if (connected) return res.json({ connected:true, message:'WhatsApp is already connected.' });
   if (!latestQR) return res.status(404).json({ connected:false, state:connectionState, message:'QR not available yet. Refresh shortly and check runtime logs.' });
