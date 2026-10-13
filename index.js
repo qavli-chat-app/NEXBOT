@@ -84,6 +84,16 @@ try {
     settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {}, warnings: s.settings?.warnings || {}, rules: s.settings?.rules || {}, customReplies: s.settings?.customReplies || {}, fallbackReplies: s.settings?.fallbackReplies || {}, blockedWords: s.settings?.blockedWords || {}, managedGroupId: s.settings?.managedGroupId || '', awayMessage: typeof s.settings?.awayMessage === 'string' ? s.settings.awayMessage : settings.awayMessage, welcomeMessage: typeof s.settings?.welcomeMessage === 'string' ? s.settings.welcomeMessage : settings.welcomeMessage, goodbyeMessage: typeof s.settings?.goodbyeMessage === 'string' ? s.settings.goodbyeMessage : settings.goodbyeMessage, replyCooldownSeconds: Number.isInteger(s.settings?.replyCooldownSeconds) ? Math.min(60, Math.max(1, s.settings.replyCooldownSeconds)) : settings.replyCooldownSeconds, goodbye: s.settings?.goodbye === true, textOnly: s.settings?.textOnly !== false, blockPhoneNumbers: s.settings?.blockPhoneNumbers !== false, blockBusinessPromo: s.settings?.blockBusinessPromo !== false, deleteMedia: s.settings?.deleteMedia !== false };
   }
 } catch (e) { logger.warn({ err: String(e) }, 'Could not load saved settings'); }
+// One-time migration: persist the strict moderation policy requested by the owner.
+if (settings.moderationPolicyVersion !== 2) {
+  settings.antiLink = true;
+  settings.textOnly = true;
+  settings.blockPhoneNumbers = true;
+  settings.blockBusinessPromo = true;
+  settings.deleteMedia = true;
+  settings.moderationPolicyVersion = 2;
+  saveState();
+}
 function saveState() {
   try { const tmp = STATE_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify({ settings }, null, 2)); fs.renameSync(tmp, STATE_FILE); }
   catch (e) { logger.error({ err: String(e) }, 'Could not save state'); }
