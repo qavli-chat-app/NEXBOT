@@ -345,7 +345,7 @@ app.post('/api/group-control/bulk', auth, groupActionLimit, async (req,res) => {
     return res.status(400).json({ error:'Select exactly one member from the current group before using a bulk role action.' });
   if (action === 'announcement' && !['on','off'].includes(value)) return res.status(400).json({ error:'For announcement, value must be on or off.' });
   if (action === 'member-messaging' && !['on','off'].includes(value)) return res.status(400).json({ error:'For member-messaging, value must be on or off.' });
-  if (action === 'edit-info' && !['admins','all'].includes(value)) return res.status(400).json({ error:'For edit-info, value must be admins or all.' });
+  if (action === 'edit-info' && !['on','off'].includes(value)) return res.status(400).json({ error:'For edit-info, value must be on or off.' });
   const results = [];
   for (const groupId of groupIds) {
     try {
@@ -378,7 +378,7 @@ app.post('/api/group-control/bulk', auth, groupActionLimit, async (req,res) => {
       } else if (action === 'member-messaging') {
         await sock.groupSettingUpdate(groupId, value === 'on' ? 'unlocked' : 'locked');
       } else if (action === 'edit-info') {
-        await sock.groupSettingUpdate(groupId, value === 'admins' ? 'locked' : 'unlocked');
+        await sock.groupSettingUpdate(groupId, value === 'on' ? 'locked' : 'unlocked');
       }
       eventStore.add('group_action_succeeded', { category:'bulk_'+action, outcome:'success' });
       results.push({ groupId, subject:meta.subject || groupId, ok:true, message:'WhatsApp accepted the action.' });
