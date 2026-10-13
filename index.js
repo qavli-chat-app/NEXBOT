@@ -38,7 +38,7 @@ function saveState() {
 }
 function auth(req, res, next) {
   if (!PANEL_KEY) return res.status(503).json({ error: 'PANEL_KEY is not configured. Set it in Railway Variables.' });
-  const provided = req.get('x-panel-key') || req.query.key || req.body?.key;
+  const provided = req.get('x-panel-key'); // Never accept panel secrets in URLs or request bodies.
   if (typeof provided !== 'string' || provided.length !== PANEL_KEY.length || !cryptoSafeEqual(provided, PANEL_KEY))
     return res.status(401).json({ error: 'Unauthorized' });
   next();
