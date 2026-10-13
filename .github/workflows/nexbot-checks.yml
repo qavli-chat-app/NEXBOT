@@ -1,0 +1,23 @@
+name: NEXBOT checks
+
+on:
+  push:
+    branches: [nexbot-pro-hardening, nexbot-pro-rebuild]
+  pull_request:
+    branches: [nexbot-pro-rebuild]
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout bot repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Check JavaScript syntax
+        run: npm test
