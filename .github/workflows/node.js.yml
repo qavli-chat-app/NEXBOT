@@ -25,7 +25,7 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: ${{ matrix.node-version }}
-        cache: 'npm'
+        # No lockfile is committed yet, so avoid setup-node's lockfile-dependent npm cache.
     - run: npm install
     - run: npm run build --if-present
     - run: npm test
