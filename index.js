@@ -386,7 +386,7 @@ async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     let version;
     try { version = (await fetchLatestBaileysVersion()).version; } catch { version = undefined; }
-    sock = makeWASocket({ version, auth: state, logger: pino({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' }).child({ module:'baileys' }), printQRInTerminal:false, browser:['NEXBOT Pro','Chrome','1.0.0'], markOnlineOnConnect:false, syncFullHistory:false, connectTimeoutMs:60000, defaultQueryTimeoutMs:60000 });
+    sock = makeWASocket({ version, auth: state, logger: pino({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' }).child({ module:'baileys' }), printQRInTerminal:false, browser:['NEXBOT Pro','Chrome','1.0.0'], markOnlineOnConnect:false, syncFullHistory:false, shouldSyncHistoryMessage:({ syncType }) => syncType !== 2, connectTimeoutMs:60000, defaultQueryTimeoutMs:60000 });
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', ({ connection, qr, lastDisconnect: ld }) => {
       if (qr) { latestQR = qr; connectionState = 'qr'; eventStore.add('connection_changed', { state:'qr_required' }); logger.info('WhatsApp QR available; open protected dashboard to pair.'); }
