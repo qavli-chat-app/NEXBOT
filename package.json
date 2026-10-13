@@ -6,7 +6,7 @@
   "description": "Self-hosted WhatsApp group moderation bot with QR pairing and admin commands.",
   "scripts": {
     "start": "node index.js",
-    "test": "node --check index.js"
+    "test": "node --check index.js && node --test"
   },
   "engines": {
     "node": ">=20"
