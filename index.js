@@ -259,9 +259,10 @@ app.get('/api/groups', auth, async (_req,res) => {
   try {
     const all = await sock.groupFetchAllParticipating();
     const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+    const sessionJids = getSessionJidCandidates();
     const adminCheckedAt = new Date().toISOString();
     const groups = Object.values(all || {}).map(g => {
-      const adminStatus = getAdminVerification(g, botJid);
+      const adminStatus = getAdminVerification(g, sessionJids);
       const botAdmin = adminStatus === 'verified_admin';
       return {
         id: g.id,
@@ -277,7 +278,7 @@ app.get('/api/groups', auth, async (_req,res) => {
         participants: (g.participants || []).map(p => ({ id:p.id, name:p.name || p.notify || p.id, admin:p.admin || '' }))
       };
     }).sort((a,b) => a.subject.localeCompare(b.subject));
-    res.json({ connected:true, count:groups.length, botJid, adminCheckedAt, groups });
+    res.json({ connected:true, count:groups.length, botJid, sessionJids, adminCheckedAt, groups });
   } catch (e) {
     logger.warn({ err:String(e) }, 'Could not fetch WhatsApp groups');
     res.status(502).json({ error:'Could not load groups from WhatsApp. Refresh and try again.' });
@@ -292,7 +293,7 @@ app.post('/api/group-control', auth, groupActionLimit, async (req,res) => {
   try {
     const meta = await sock.groupMetadata(groupId);
     const botId = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
-    if (!isAdmin(meta, botId)) return res.status(403).json({ error:'Make the bot an admin in this group first.' });
+    if (!isAdmin(meta, getSessionJidCandidates())) return res.status(403).json({ error:'Make the bot an admin in this group first.' });
     let result = { ok:true, action };
     if (action === 'subject') {
       if (typeof value !== 'string' || !value.trim()) return res.status(400).json({error:'Group name is required.'});
@@ -351,7 +352,7 @@ app.post('/api/group-control/bulk', auth, groupActionLimit, async (req,res) => {
     try {
       const meta = await sock.groupMetadata(groupId);
       const botId = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
-      if (!isAdmin(meta, botId)) {
+      if (!isAdmin(meta, getSessionJidCandidates())) {
         results.push({ groupId, subject:meta.subject || groupId, ok:false, error:'NEXBOT is not a group admin.' });
         eventStore.add('group_action_failed', { category:'bulk_'+action, outcome:'failed', reason:'bot_not_admin' });
         continue;
@@ -421,6 +422,16 @@ function warnKey(groupId, userId) { return groupId + '|' + userId; }
 function getWarnings(groupId,userId) { return settings.warnings[warnKey(groupId,userId)] || []; }
 function addWarning(groupId,userId,by,reason) { const k=warnKey(groupId,userId); const arr=getWarnings(groupId,userId); arr.push({by,reason:reason||'No reason provided',at:new Date().toISOString()}); settings.warnings[k]=arr.slice(-20); saveState(); return settings.warnings[k]; }
 function parseTargets(msg) { return [...new Set([...mentionedJids(msg), ...(msg.message?.extendedTextMessage?.contextInfo?.participant ? [msg.message.extendedTextMessage.contextInfo.participant] : [])])]; }
+function getSessionJidCandidates() {
+  const user = sock?.user || {};
+  return [...new Set([
+    user.id,
+    typeof user.id === 'string' ? user.id.split(':')[0] + '@s.whatsapp.net' : '',
+    user.lid,
+    user.phoneNumber,
+    user.id?.split(':')[0]
+  ].filter(value => typeof value === 'string' && value.trim()))];
+}
 function isAdmin(meta, jid) { return isGroupAdmin(meta, jid); }
 function mentionedJids(msg) {
   const ctx = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo || {};
@@ -439,7 +450,7 @@ async function moderateLink(msg, groupId, meta) {
   const sender = msg.key.participant || msg.key.remoteJid;
   if (isAdmin(meta, sender) || sender === OWNER + '@s.whatsapp.net') return false;
   const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
-  if (!isAdmin(meta, botJid)) { eventStore.add('moderation_action', { category:'link', outcome:'blocked_no_admin' }); logger.warn({ groupId }, 'Anti-link enabled but bot is not admin'); return false; }
+  if (!isAdmin(meta, getSessionJidCandidates())) { eventStore.add('moderation_action', { category:'link', outcome:'blocked_no_admin' }); logger.warn({ groupId }, 'Anti-link enabled but bot is not admin'); return false; }
   try { await sock.sendMessage(groupId, { delete: msg.key }); eventStore.add('moderation_action', { category:'link', outcome:'deleted' }); await sendText(groupId, '⚠️ Link removed. Please follow group rules.'); return true; }
   catch (e) { logger.warn({ err:String(e) }, 'Link moderation failed'); return false; }
 }
@@ -527,14 +538,14 @@ async function startBot() {
               const reason = hasNonText ? 'non-text content' : hasLink ? 'link' : hasPhone ? 'phone number' : 'business promotion';
               const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
               let deleted = false;
-              if (settings.deleteMedia && isAdmin(meta, botJid)) {
+              if (settings.deleteMedia && isAdmin(meta, getSessionJidCandidates())) {
                 try { await sock.sendMessage(jid, { delete: msg.key }); deleted = true; }
                 catch (e) { logger.warn({ err:String(e), groupId:jid }, 'Could not delete a text-only rule violation'); }
               }
               const warnings = addWarning(jid, sender, botJid, reason);
               eventStore.add('moderation_action', {
                 category:'text_only',
-                outcome: deleted ? 'deleted_and_warned' : (!meta ? 'admin_status_unknown_warned' : (isAdmin(meta, botJid) ? 'delete_failed_warned' : 'bot_not_admin_warned'))
+                outcome: deleted ? 'deleted_and_warned' : (!meta ? 'admin_status_unknown_warned' : (isAdmin(meta, getSessionJidCandidates()) ? 'delete_failed_warned' : 'bot_not_admin_warned'))
               });
               const warningText = '⚠️ @' + sender.split('@')[0] + ': this group allows text messages only. Media, links, phone numbers and business promotions are not allowed. Warning ' + warnings.length + '.';
               await sock.sendMessage(jid, { text:warningText, mentions:[sender] }).catch(() => {});
@@ -551,7 +562,7 @@ async function startBot() {
                 eventStore.add('moderation_action', { category:'anti_spam', outcome:'triggered' });
                 recentMessages.set(key, []);
                 await sendText(jid, '⚠️ Please slow down; anti-spam detected rapid messages.', msg);
-                if (isAdmin(meta, sock.user?.id?.split(':')[0] + '@s.whatsapp.net')) {
+                if (isAdmin(meta, getSessionJidCandidates())) {
                   try { await sock.sendMessage(jid,{delete:msg.key}); } catch {}
                 }
                 continue;
@@ -561,7 +572,7 @@ async function startBot() {
             const bad = settings.blockedWords[jid] || [];
             if (text && bad.some(w => w && text.toLowerCase().includes(w.toLowerCase())) && !isAdmin(meta, sender)) {
               eventStore.add('moderation_action', { category:'blocked_word', outcome:'triggered' });
-              if (isAdmin(meta, sock.user?.id?.split(':')[0] + '@s.whatsapp.net')) await sock.sendMessage(jid, { delete: msg.key }).catch(() => {});
+              if (isAdmin(meta, getSessionJidCandidates())) await sock.sendMessage(jid, { delete: msg.key }).catch(() => {});
               await sendText(jid, '⚠️ Please keep the group respectful and follow its rules.', msg);
               continue;
             }
@@ -598,7 +609,7 @@ async function startBot() {
           const isOwner = Boolean(OWNER && senderNumber === OWNER);
           const senderIsAdmin = isOwner || (isGroup && isAdmin(meta, sender));
           const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
-          const botIsAdmin = isGroup && isAdmin(meta, botJid);
+          const botIsAdmin = isGroup && isAdmin(meta, getSessionJidCandidates());
           const reply = t => sendText(jid, t, msg);
           if (cmd === 'ping') await reply('🏓 Pong! NEXBOT Pro is online. Connection: ' + connectionState);
           else if (cmd === 'help' || cmd === 'menu') await reply('⚡ NEXBOT PRO — COMMAND MENU\n' + PREFIX + 'ping | status | help | menu\n' + PREFIX + 'rules | groupinfo | admins\n' + PREFIX + 'kick @user | promote @user | makeadmin @user | demote @user | tagall\n' + PREFIX + 'warn @user [reason] | warnings @user | clearwarn @user (3 warnings removes member)\n' + PREFIX + 'setrules [text] | subject [name] | description [text]\n' + PREFIX + 'antilink on/off | antispam on/off | welcome on/off\n' + PREFIX + 'addreply trigger | response | delreply trigger | replies\n' + PREFIX + 'badword add word | badword remove word | badwords\n' + PREFIX + 'ai [question] (optional provider key)\nAdmin commands require group-admin rights; the bot must also be a group admin for moderation.');
