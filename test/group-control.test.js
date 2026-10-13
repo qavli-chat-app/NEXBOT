@@ -11,7 +11,7 @@ test('bulk group control is bounded and checks admin and target membership per g
   const endpoint = source.slice(start, end);
   assert.match(endpoint, /groupIds\.length > 20/, 'a batch must be capped at 20 groups');
   assert.match(endpoint, /const allowed = \['promote','demote','announcement','member-messaging','edit-info'\]/);
-  assert.match(endpoint, /if \(!isAdmin\(meta, botId\)\)/, 'each group must check bot admin rights');
+  assert.match(endpoint, /if \(!isAdmin\(meta, getSessionJidCandidates\(\)\)\)/, 'each group must check the connected session admin identity');
   assert.match(endpoint, /target_not_member/, 'role actions must reject a target absent from a group');
   assert.match(endpoint, /groupParticipantsUpdate\(groupId, \[target\], action\)/);
   assert.match(endpoint, /group_action_failed/);
