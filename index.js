@@ -324,8 +324,14 @@ app.get('/api/qr', auth, async (_req,res) => {
   catch { res.status(500).json({ error:'QR generation failed' }); }
 });
 app.post('/api/settings', auth, (req,res) => {
-  const allowed = ['antiLink','antiSpam','welcome','goodbye','privateProtection','textOnly','blockPhoneNumbers','blockBusinessPromo','deleteMedia'];
+  const allowed = ['antiLink','antiSpam','welcome','goodbye','privateProtection'];
   for (const key of allowed) if (typeof req.body?.[key] === 'boolean') settings[key] = req.body[key];
+  // Strict owner-requested group policy cannot be switched off from the dashboard/API.
+  settings.antiLink = true;
+  settings.textOnly = true;
+  settings.blockPhoneNumbers = true;
+  settings.blockBusinessPromo = true;
+  settings.deleteMedia = true;
   for (const key of ['awayMessage','welcomeMessage','goodbyeMessage']) if (typeof req.body?.[key] === 'string' && req.body[key].length <= 1000) settings[key] = req.body[key].trim();
   if (Number.isInteger(req.body?.replyCooldownSeconds) && req.body.replyCooldownSeconds >= 1 && req.body.replyCooldownSeconds <= 60) settings.replyCooldownSeconds = req.body.replyCooldownSeconds;
   if (typeof req.body?.managedGroupId === 'string' && (req.body.managedGroupId === '' || req.body.managedGroupId.endsWith('@g.us'))) settings.managedGroupId = req.body.managedGroupId;
