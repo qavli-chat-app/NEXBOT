@@ -9,7 +9,7 @@ test('bulk group control is bounded and checks admin and target membership per g
   assert.notEqual(start, -1, 'bulk control endpoint must exist');
   assert.ok(end > start, 'bulk endpoint must end before QR endpoint');
   const endpoint = source.slice(start, end);
-  assert.match(endpoint, /slice\(0,20\)/, 'a batch must be capped at 20 groups');
+  assert.match(endpoint, /groupIds\.length > 20/, 'a batch must be capped at 20 groups');
   assert.match(endpoint, /const allowed = \['promote','demote','announcement','member-messaging','edit-info'\]/);
   assert.match(endpoint, /if \(!isAdmin\(meta, botId\)\)/, 'each group must check bot admin rights');
   assert.match(endpoint, /target_not_member/, 'role actions must reject a target absent from a group');
