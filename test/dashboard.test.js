@@ -13,4 +13,9 @@ test('dashboard inline JavaScript parses and all required navigation views exist
     assert.match(html, new RegExp('data-view="' + view + '"'));
     assert.match(html, new RegExp('id="view-' + view + '"'));
   }
+  assert.match(html, /All Groups Control Center/);
+  assert.match(html, /id="bulkGroupAction"/);
+  assert.match(html, /function runBulkGroupAction\(\)/);
+  assert.match(html, /\/api\/group-control\/bulk/);
+  assert.match(html, /Please confirm this bulk WhatsApp action/);
 });
