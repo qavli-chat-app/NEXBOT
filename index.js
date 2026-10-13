@@ -259,9 +259,10 @@ app.get('/api/groups', auth, async (_req,res) => {
   try {
     const all = await sock.groupFetchAllParticipating();
     const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+    const sessionJids = getSessionJidCandidates();
     const adminCheckedAt = new Date().toISOString();
     const groups = Object.values(all || {}).map(g => {
-      const adminStatus = getAdminVerification(g, botJid);
+      const adminStatus = getAdminVerification(g, sessionJids);
       const botAdmin = adminStatus === 'verified_admin';
       return {
         id: g.id,
@@ -277,7 +278,7 @@ app.get('/api/groups', auth, async (_req,res) => {
         participants: (g.participants || []).map(p => ({ id:p.id, name:p.name || p.notify || p.id, admin:p.admin || '' }))
       };
     }).sort((a,b) => a.subject.localeCompare(b.subject));
-    res.json({ connected:true, count:groups.length, botJid, adminCheckedAt, groups });
+    res.json({ connected:true, count:groups.length, botJid, sessionJids, adminCheckedAt, groups });
   } catch (e) {
     logger.warn({ err:String(e) }, 'Could not fetch WhatsApp groups');
     res.status(502).json({ error:'Could not load groups from WhatsApp. Refresh and try again.' });
@@ -421,7 +422,20 @@ function warnKey(groupId, userId) { return groupId + '|' + userId; }
 function getWarnings(groupId,userId) { return settings.warnings[warnKey(groupId,userId)] || []; }
 function addWarning(groupId,userId,by,reason) { const k=warnKey(groupId,userId); const arr=getWarnings(groupId,userId); arr.push({by,reason:reason||'No reason provided',at:new Date().toISOString()}); settings.warnings[k]=arr.slice(-20); saveState(); return settings.warnings[k]; }
 function parseTargets(msg) { return [...new Set([...mentionedJids(msg), ...(msg.message?.extendedTextMessage?.contextInfo?.participant ? [msg.message.extendedTextMessage.contextInfo.participant] : [])])]; }
-function isAdmin(meta, jid) { return isGroupAdmin(meta, jid); }
+function getSessionJidCandidates() {
+  const user = sock?.user || {};
+  return [...new Set([
+    user.id,
+    typeof user.id === 'string' ? user.id.split(':')[0] + '@s.whatsapp.net' : '',
+    user.lid,
+    user.phoneNumber,
+    user.id?.split(':')[0]
+  ].filter(value => typeof value === 'string' && value.trim()))];
+}
+function isAdmin(meta, jid) {
+  const candidates = [...new Set([...getSessionJidCandidates(), ...(Array.isArray(jid) ? jid : [jid])].filter(Boolean))];
+  return isGroupAdmin(meta, candidates);
+}
 function mentionedJids(msg) {
   const ctx = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo || {};
   return ctx.mentionedJid || [];
