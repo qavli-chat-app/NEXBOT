@@ -75,7 +75,7 @@ function scheduleReconnect(reason = 'connection closed') {
 }
 let settings = { antiLink: true, antiSpam: true, welcome: true, privateProtection: true, groups: {}, warnings: {}, rules: {}, customReplies: {}, blockedWords: {}, managedGroupId: '', textOnly: true, blockPhoneNumbers: true, blockBusinessPromo: true, deleteMedia: true };
 let messageCount = 0, commandCount = 0, lastMessageAt = null;
-const recentMessages = new Map(), privateReplyAt = new Map(), commandCooldown = new Map();
+const recentMessages = new Map(), privateReplyAt = new Map(), commandCooldown = new Map(), processedMessageIds = new Map();
 const cooldown = (key, ms) => { const now=Date.now(), prev=commandCooldown.get(key)||0; if(now-prev<ms) return false; commandCooldown.set(key,now); return true; };
 try {
   if (fs.existsSync(STATE_FILE)) {
@@ -372,6 +372,16 @@ async function startBot() {
           if (!msg.message || msg.key.fromMe) continue;
           const jid = msg.key.remoteJid;
           if (!jid || jid === 'status@broadcast') continue;
+          const eventId = msg.key.id ? jid + '|' + msg.key.id : '';
+          if (eventId && processedMessageIds.has(eventId)) continue;
+          if (eventId) {
+            processedMessageIds.set(eventId, Date.now());
+            if (processedMessageIds.size > 5000) {
+              const cutoff = Date.now() - 10 * 60 * 1000;
+              for (const [key, at] of processedMessageIds) if (at < cutoff) processedMessageIds.delete(key);
+              while (processedMessageIds.size > 5000) processedMessageIds.delete(processedMessageIds.keys().next().value);
+            }
+          }
           messageCount++; lastMessageAt = new Date().toISOString();
           const text = getText(msg.message).trim();
           const isGroup = jid.endsWith('@g.us');
@@ -477,7 +487,7 @@ async function startBot() {
             if(!question){await reply('Usage: '+PREFIX+'ai your question');continue;}
             if(!apiKey){await reply('AI is not configured. Add an OpenRouter API key in Railway Variables; provider usage may have limits/costs.');continue;}
             if(!cooldown('ai:'+sender,10000)){await reply('Please wait a few seconds before asking AI again.');continue;}
-            try { const resp=await fetch('https://openrouter.ai/api/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+apiKey,'Content-Type':'application/json'},body:JSON.stringify({model:process.env.AI_MODEL||'openrouter/auto',messages:[{role:'system',content:'You are NEXBOT, a helpful concise WhatsApp assistant. Follow safety rules.'},{role:'user',content:question}],max_tokens:700})}); const data=await resp.json(); const answer=data.choices?.[0]?.message?.content; await reply(answer ? String(answer).slice(0,3500) : 'AI provider returned no answer. Check key, model and provider limits.'); } catch(e){logger.warn({err:String(e)},'AI request failed');await reply('AI request failed. Please try later.');}
+            try { const resp=await fetch('https://openrouter.ai/api/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+apiKey,'Content-Type':'application/json'},body:JSON.stringify({model:process.env.AI_MODEL||'openrouter/auto',messages:[{role:'system',content:'You are NEXBOT, a helpful concise WhatsApp assistant. Follow safety rules.'},{role:'user',content:question}],max_tokens:700}),signal:AbortSignal.timeout(15000)}); if(!resp.ok){await reply('AI provider returned HTTP '+resp.status+'. Check provider limits and configuration.');continue;} const data=await resp.json(); const answer=data.choices?.[0]?.message?.content; await reply(answer ? String(answer).slice(0,3500) : 'AI provider returned no answer. Check key, model and provider limits.'); } catch(e){logger.warn({err:String(e)},'AI request failed');await reply('AI request failed. Please try later.');}
           }
           else if (['kick','promote','demote','tagall','antilink','antispam','welcome','warn','warnings','clearwarn','setrules','subject','description'].includes(cmd)) {
             if (!isGroup) { await reply('This command only works in groups.'); continue; }
