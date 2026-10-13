@@ -284,6 +284,39 @@ app.get('/api/groups', auth, async (_req,res) => {
     res.status(502).json({ error:'Could not load groups from WhatsApp. Refresh and try again.' });
   }
 });
+const adminRequestAt = new Map();
+app.post('/api/group-admin-request', auth, groupActionLimit, async (req,res) => {
+  if (!sock || !connected) return res.status(503).json({ error:'WhatsApp is not connected. Pair the account first.' });
+  const { groupId } = req.body || {};
+  if (typeof groupId !== 'string' || !groupId.endsWith('@g.us')) return res.status(400).json({ error:'Select a valid WhatsApp group first.' });
+  const now = Date.now(), previous = adminRequestAt.get(groupId) || 0;
+  if (now - previous < 5 * 60 * 1000) {
+    const waitSeconds = Math.ceil((5 * 60 * 1000 - (now - previous)) / 1000);
+    return res.status(429).json({ error:'An admin request was sent recently. Please wait ' + waitSeconds + ' seconds before sending another.' });
+  }
+  try {
+    const meta = await sock.groupMetadata(groupId);
+    const sessionJids = getSessionJidCandidates();
+    if (getAdminVerification(meta, sessionJids) === 'verified_admin') {
+      return res.json({ ok:true, alreadyAdmin:true, message:'NEXBOT is already verified as a group admin. Refresh the group list to update the dashboard.' });
+    }
+    const admins = (meta.participants || []).filter(p => p.admin === 'admin' || p.admin === 'superadmin');
+    if (!admins.length) return res.status(409).json({ error:'WhatsApp did not return any current group admins to notify.' });
+    const mentions = [...new Set(admins.map(p => p.id).filter(id => typeof id === 'string' && id.endsWith('@s.whatsapp.net')))];
+    if (!mentions.length) return res.status(409).json({ error:'Could not identify the current group admins for a mention.' });
+    const botAccount = sock.user?.id || 'the connected NEXBOT account';
+    const mentionText = mentions.map(id => '@' + id.split('@')[0].split(':')[0]).join(' ');
+    const message = '🤖 NEXBOT PRO admin request\n\n' + mentionText + '\nPlease make the connected NEXBOT WhatsApp account (' + botAccount.split('@')[0].split(':')[0] + ') a group admin so it can manage group settings and moderation.\n\nTo approve: open Group info → Participants → select the NEXBOT account → Make group admin. Only a current group admin can approve this request.';
+    await sock.sendMessage(groupId, { text:message, mentions });
+    adminRequestAt.set(groupId, now);
+    eventStore.add('group_admin_request_sent', { category:'group', outcome:'success' });
+    res.json({ ok:true, notifiedAdmins:mentions.length, message:'Admin request sent in this WhatsApp group, mentioning ' + mentions.length + ' current admin(s). They must promote NEXBOT manually.' });
+  } catch (e) {
+    eventStore.add('group_admin_request_failed', { category:'group', outcome:'failed' });
+    logger.warn({ err:String(e), groupId }, 'Could not send group admin request');
+    res.status(502).json({ error:'WhatsApp could not send the admin request. Check group messaging permissions and try again.' });
+  }
+});
 app.post('/api/group-control', auth, groupActionLimit, async (req,res) => {
   if (!sock || !connected) return res.status(503).json({ error:'WhatsApp is not connected.' });
   const { groupId, action, value, targetIds } = req.body || {};
