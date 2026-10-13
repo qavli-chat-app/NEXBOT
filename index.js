@@ -327,8 +327,8 @@ async function moderateLink(msg, groupId, meta) {
   const sender = msg.key.participant || msg.key.remoteJid;
   if (isAdmin(meta, sender) || sender === OWNER + '@s.whatsapp.net') return false;
   const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
-  if (!isAdmin(meta, botJid)) { logger.warn({ groupId }, 'Anti-link enabled but bot is not admin'); return false; }
-  try { await sock.sendMessage(groupId, { delete: msg.key }); await sendText(groupId, '⚠️ Link removed. Please follow group rules.'); return true; }
+  if (!isAdmin(meta, botJid)) { eventStore.add('moderation_action', { category:'link', outcome:'blocked_no_admin' }); logger.warn({ groupId }, 'Anti-link enabled but bot is not admin'); return false; }
+  try { await sock.sendMessage(groupId, { delete: msg.key }); eventStore.add('moderation_action', { category:'link', outcome:'deleted' }); await sendText(groupId, '⚠️ Link removed. Please follow group rules.'); return true; }
   catch (e) { logger.warn({ err:String(e) }, 'Link moderation failed'); return false; }
 }
 function getText(m={}) {
@@ -400,6 +400,7 @@ async function startBot() {
             const hasPhone = settings.blockPhoneNumbers && /(?:\+?\d[\d .()\-]{7,}\d)/.test(rawText);
             const hasPromo = settings.blockBusinessPromo && /\b(whatsapp|contact|call|business|service|deal|price|order|subscribe|dm me|inbox me|promo|marketing)\b/i.test(rawText);
             if ((settings.textOnly && mediaFound) || (settings.antiLink && /https?:\/\/|www\.|chat\.whatsapp\.com\//i.test(rawText)) || hasPhone || hasPromo) {
+              eventStore.add('moderation_action', { category:'strict_filter', outcome:'triggered' });
               const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
               if (settings.deleteMedia && isAdmin(meta, botJid)) await sock.sendMessage(jid, { delete: msg.key }).catch(() => {});
               await sendText(jid, '🔒 This group is text-only. Media, links, phone numbers and business promotions are not allowed. Please send a simple text message.', msg).catch(() => {});
@@ -413,6 +414,7 @@ async function startBot() {
               const arr = (recentMessages.get(key) || []).filter(t => now-t < 8000);
               arr.push(now); recentMessages.set(key, arr);
               if (arr.length >= 6 && !isAdmin(meta,sender)) {
+                eventStore.add('moderation_action', { category:'anti_spam', outcome:'triggered' });
                 recentMessages.set(key, []);
                 await sendText(jid, '⚠️ Please slow down; anti-spam detected rapid messages.', msg);
                 if (isAdmin(meta, sock.user?.id?.split(':')[0] + '@s.whatsapp.net')) {
@@ -424,6 +426,7 @@ async function startBot() {
             if (await moderateLink(msg, jid, meta)) continue;
             const bad = settings.blockedWords[jid] || [];
             if (text && bad.some(w => w && text.toLowerCase().includes(w.toLowerCase())) && !isAdmin(meta, sender)) {
+              eventStore.add('moderation_action', { category:'blocked_word', outcome:'triggered' });
               if (isAdmin(meta, sock.user?.id?.split(':')[0] + '@s.whatsapp.net')) await sock.sendMessage(jid, { delete: msg.key }).catch(() => {});
               await sendText(jid, '⚠️ Please keep the group respectful and follow its rules.', msg);
               continue;
