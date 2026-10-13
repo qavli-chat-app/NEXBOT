@@ -4,8 +4,13 @@
   "private": true,
   "type": "module",
   "description": "Self-hosted WhatsApp group moderation bot with QR pairing and admin commands.",
-  "scripts": { "start": "node index.js" },
-  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --check index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.18",
     "express": "^4.21.2",
