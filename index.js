@@ -551,7 +551,7 @@ async function startBot() {
             else { const trigger = raw.toLowerCase().trim(); if (!settings.customReplies[jid]?.[trigger]) { await reply('No matching trigger found. Use ' + PREFIX + 'replies'); continue; } delete settings.customReplies[jid][trigger]; saveState(); await reply('✅ Custom reply removed.'); }
           }
           else if (cmd === 'badwords' || cmd === 'badword') {
-            if (!isGroup || (!senderIsAdmin && sender.replace(/\D/g,'') !== OWNER)) { await reply('⛔ Only group admins can manage blocked words.'); continue; }
+            if (!isGroup || (!senderIsAdmin && !isOwner)) { await reply('⛔ Only group admins can manage blocked words.'); continue; }
             if (cmd === 'badwords') { await reply('🚫 Blocked words: ' + ((settings.blockedWords[jid] || []).join(', ') || 'none')); continue; }
             const action = (args.shift() || '').toLowerCase(), word = args.join(' ').trim().toLowerCase();
             if (!['add','remove'].includes(action) || !word || word.length > 40 || /[\\r\\n]/.test(word)) { await reply('Usage: ' + PREFIX + 'badword add word OR ' + PREFIX + 'badword remove word'); continue; }
@@ -569,7 +569,7 @@ async function startBot() {
           }
           else if (['kick','promote','makeadmin','demote','tagall','antilink','antispam','welcome','warn','warnings','clearwarn','setrules','subject','description'].includes(cmd)) {
             if (!isGroup) { await reply('This command only works in groups.'); continue; }
-            if (!senderIsAdmin && sender.replace(/\D/g,'') !== OWNER) { await reply('⛔ Only group admins can use this command.'); continue; }
+            if (!senderIsAdmin && !isOwner) { await reply('⛔ Only group admins can use this command.'); continue; }
             if (!botIsAdmin) { await reply('⚠️ Please make NEXBOT an admin first.'); continue; }
             const targets = parseTargets(msg);
             if (cmd === 'setrules') { const ruleText=args.join(' ').trim(); if(!ruleText){await reply('Usage: '+PREFIX+'setrules your group rules');continue;} settings.rules[jid]=ruleText.slice(0,2000);saveState();await reply('✅ Group rules updated.'); }
