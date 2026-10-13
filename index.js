@@ -543,13 +543,13 @@ async function startBot() {
           }
           else if (cmd === 'replies') { const list = settings.customReplies[jid] || {}; await reply('🧩 Custom replies:\n' + (Object.keys(list).length ? Object.keys(list).map(k => k + ' → ' + list[k]).join('\n') : 'No custom replies yet. Add one with ' + PREFIX + 'addreply trigger | response')); }
           else if (cmd === 'addreply' || cmd === 'delreply') {
-            if (!isGroup || (!senderIsAdmin && sender.replace(/\\D/g,'') !== OWNER)) { await reply('⛔ Only group admins can manage custom replies in a group.'); continue; }
+            if (!isGroup || (!senderIsAdmin && sender.replace(/\D/g,'') !== OWNER)) { await reply('⛔ Only group admins can manage custom replies in a group.'); continue; }
             const raw = args.join(' '), partsReply = raw.split('|').map(x => x.trim());
             if (cmd === 'addreply') { if (partsReply.length < 2 || !partsReply[0] || !partsReply[1]) { await reply('Usage: ' + PREFIX + 'addreply trigger | response'); continue; } settings.customReplies[jid] = settings.customReplies[jid] || {}; settings.customReplies[jid][partsReply[0].toLowerCase().slice(0,60)] = partsReply.slice(1).join(' | ').slice(0,1000); saveState(); await reply('✅ Custom reply saved.'); }
             else { const trigger = raw.toLowerCase().trim(); if (!settings.customReplies[jid]?.[trigger]) { await reply('No matching trigger found. Use ' + PREFIX + 'replies'); continue; } delete settings.customReplies[jid][trigger]; saveState(); await reply('✅ Custom reply removed.'); }
           }
           else if (cmd === 'badwords' || cmd === 'badword') {
-            if (!isGroup || (!senderIsAdmin && sender.replace(/\\D/g,'') !== OWNER)) { await reply('⛔ Only group admins can manage blocked words.'); continue; }
+            if (!isGroup || (!senderIsAdmin && sender.replace(/\D/g,'') !== OWNER)) { await reply('⛔ Only group admins can manage blocked words.'); continue; }
             if (cmd === 'badwords') { await reply('🚫 Blocked words: ' + ((settings.blockedWords[jid] || []).join(', ') || 'none')); continue; }
             const action = (args.shift() || '').toLowerCase(), word = args.join(' ').trim().toLowerCase();
             if (!['add','remove'].includes(action) || !word || word.length > 40 || /[\\r\\n]/.test(word)) { await reply('Usage: ' + PREFIX + 'badword add word OR ' + PREFIX + 'badword remove word'); continue; }
