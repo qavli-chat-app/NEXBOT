@@ -55,3 +55,30 @@ test('workflow persists and runs matching replies; test mode has no side effects
     fs.rmSync(dir,{recursive:true,force:true});
   }
 });
+
+test('webhook workflow persists but cannot execute after its host is removed from the allowlist', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexbot-webhook-'));
+  try {
+    const events = createEventStore(path.join(dir,'events.ndjson'));
+    const filePath = path.join(dir,'workflows.json');
+    const workflow = {
+      name:'Trusted webhook',
+      enabled:true,
+      nodes:[
+        {id:'trigger',type:'incoming_message',config:{}},
+        {id:'hook',type:'webhook',config:{url:'https://hooks.example.com/notify'}},
+        {id:'end',type:'end',config:{}}
+      ],
+      edges:[{from:'trigger',to:'hook',when:'always'},{from:'hook',to:'end',when:'always'}]
+    };
+    const trusted = createWorkflowEngine({filePath,eventStore:events,webhookAllowlist:['hooks.example.com'],sendText:async()=>{}});
+    const saved = trusted.save(workflow);
+    assert.equal(saved.ok,true);
+    const lockedDown = createWorkflowEngine({filePath,eventStore:events,webhookAllowlist:[],sendText:async()=>{}});
+    assert.equal(lockedDown.list().length,1);
+    await lockedDown.runForMessage({jid:'123@g.us',sender:'123@s.whatsapp.net',text:'hello',isGroup:true});
+    assert.ok(events.list({type:'workflow_run'}).some(e=>e.outcome==='failed'));
+  } finally {
+    fs.rmSync(dir,{recursive:true,force:true});
+  }
+});
