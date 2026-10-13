@@ -41,8 +41,11 @@ test('workflow validator rejects missing trigger and malformed graphs', () => {
   assert.ok(validateWorkflow({ name: 'Broken', nodes: [], edges: [] }).length > 0);
   assert.ok(validateWorkflow({
     name: 'No trigger',
-    nodes: [{ id: 'reply', type: 'send_text', config: { text: 'Hi' } }],
-    edges: []
+    nodes: [
+      { id: 'reply', type: 'send_text', config: { text: 'Hi' } },
+      { id: 'end', type: 'end', config: {} }
+    ],
+    edges: [{ from: 'reply', to: 'end' }]
   }).some(error => error.includes('incoming_message')));
 });
 
