@@ -5,7 +5,7 @@ name: Node.js CI
 
 on:
   push:
-    branches: [ "main", "nexbot-pro-rebuild" ]
+    branches: [ "main", "nexbot-pro-rebuild", "nexbot-all-groups-control-center" ]
   pull_request:
     branches: [ "main" ]
 
