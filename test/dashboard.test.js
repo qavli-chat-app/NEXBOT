@@ -21,4 +21,8 @@ test('dashboard inline JavaScript parses and all required navigation views exist
   assert.match(html, /function runBulkGroupAction\(\)/);
   assert.match(html, /\/api\/group-control\/bulk/);
   assert.match(html, /Please confirm this bulk WhatsApp action/);
+  assert.match(html, /id="rememberPanelKey"/);
+  assert.match(html, /function restoreDashboardAccess\(\)/);
+  assert.match(html, /nexbot_panel_key/);
+  assert.match(html, /function disconnectDashboard\(\)/);
 });
