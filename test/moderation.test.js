@@ -60,7 +60,7 @@ test('strict group moderation detects media and nested WhatsApp message wrappers
     { locationMessage: {} },
     { pollCreationMessage: {} },
     { productMessage: {} },
-    { ephemeralMessage: { message: { viewOnceMessageV2: { message: { imageMessage: {} } } } }
+    { ephemeralMessage: { message: { viewOnceMessageV2: { message: { imageMessage: {} } } } } }
   ]) {
     assert.equal(getMessageModerationViolation(message)?.reason, 'non-text content');
   }
