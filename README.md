@@ -65,3 +65,8 @@ Manual verification still requires the owner's WhatsApp account and (for group o
 - Moderation is pattern-based, not AI-perfect: new slang or heavily disguised terms may evade it, and some ordinary text may be flagged. Actual WhatsApp voice/video calls are not reliably blockable through this unofficial integration; call links and message payloads are filtered when WhatsApp exposes them as messages. Test in a small group first.
 - Never share `PANEL_KEY`, a live QR code, API keys, or session files. The settings backup intentionally excludes WhatsApp authentication credentials.
 - Do not claim live commands or group moderation are verified until tested with the account owner’s connected WhatsApp session.
+
+
+## Strict group moderation (locked policy)
+
+NEXBOT enforces text-only messages in every group: media, stickers, documents, contact/location/poll/business cards and interactive payloads are rejected; links (including common obfuscated forms), phone-number-like messages, business promotions, and adult/profane words are blocked. Link and anti-spam controls cannot be disabled through group commands or dashboard settings. The bot warns members and attempts to delete violating messages; after three recorded violations it attempts to remove non-admin members when WhatsApp permits. The bot must be a group admin for deletion/removal actions. Pattern-based moderation can still have false positives or miss new evasions. The unofficial Baileys integration cannot reliably prevent actual live WhatsApp voice/video calls; it can only moderate call-related messages/links it receives.
