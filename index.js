@@ -8,7 +8,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import { createEventStore } from './lib/event-store.js';
 import { createWorkflowEngine } from './lib/workflow-engine.js';
-import { hasUrlLikeContent, hasBusinessPromotion, isGroupAdmin, getAdminVerification } from './lib/moderation.js';
+import { getMessageModerationViolation, getMessageText, hasBlockedWordContent, isGroupAdmin, getAdminVerification } from './lib/moderation.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -75,24 +75,25 @@ function scheduleReconnect(reason = 'connection closed') {
   }, delay);
   reconnectTimer.unref?.();
 }
-let settings = { antiLink: true, antiSpam: true, welcome: true, goodbye: false, privateProtection: true, awayMessage:'I am not accepting private messages. Please do not message me.', welcomeMessage:'👋 Welcome @{{user}}! Please read the group rules.', goodbyeMessage:'Goodbye @{{user}}. Take care!', fallbackReplies:{}, replyCooldownSeconds:3, groups: {}, warnings: {}, rules: {}, customReplies: {}, blockedWords: {}, managedGroupId: '', textOnly: true, blockPhoneNumbers: true, blockBusinessPromo: true, deleteMedia: true };
+let settings = { antiLink: true, antiSpam: true, welcome: true, goodbye: false, privateProtection: true, awayMessage:'I am not accepting private messages. Please do not message me.', welcomeMessage:'👋 Welcome @{{user}}! Please read the group rules.', goodbyeMessage:'Goodbye @{{user}}. Take care!', fallbackReplies:{}, replyCooldownSeconds:3, groups: {}, warnings: {}, rules: {}, customReplies: {}, blockedWords: {}, managedGroupId: '', textOnly: true, blockPhoneNumbers: true, blockBusinessPromo: true, deleteMedia: true, blockAdultWords: true, moderationPolicyVersion: 3 };
 let messageCount = 0, commandCount = 0, lastMessageAt = null;
 const recentMessages = new Map(), privateReplyAt = new Map(), commandCooldown = new Map(), processedMessageIds = new Map();
 const cooldown = (key, ms) => { const now=Date.now(), prev=commandCooldown.get(key)||0; if(now-prev<ms) return false; commandCooldown.set(key,now); return true; };
 try {
   if (fs.existsSync(STATE_FILE)) {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {}, warnings: s.settings?.warnings || {}, rules: s.settings?.rules || {}, customReplies: s.settings?.customReplies || {}, fallbackReplies: s.settings?.fallbackReplies || {}, blockedWords: s.settings?.blockedWords || {}, managedGroupId: s.settings?.managedGroupId || '', awayMessage: typeof s.settings?.awayMessage === 'string' ? s.settings.awayMessage : settings.awayMessage, welcomeMessage: typeof s.settings?.welcomeMessage === 'string' ? s.settings.welcomeMessage : settings.welcomeMessage, goodbyeMessage: typeof s.settings?.goodbyeMessage === 'string' ? s.settings.goodbyeMessage : settings.goodbyeMessage, replyCooldownSeconds: Number.isInteger(s.settings?.replyCooldownSeconds) ? Math.min(60, Math.max(1, s.settings.replyCooldownSeconds)) : settings.replyCooldownSeconds, goodbye: s.settings?.goodbye === true, textOnly: s.settings?.textOnly !== false, blockPhoneNumbers: s.settings?.blockPhoneNumbers !== false, blockBusinessPromo: s.settings?.blockBusinessPromo !== false, deleteMedia: s.settings?.deleteMedia !== false };
+    settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {}, warnings: s.settings?.warnings || {}, rules: s.settings?.rules || {}, customReplies: s.settings?.customReplies || {}, fallbackReplies: s.settings?.fallbackReplies || {}, blockedWords: s.settings?.blockedWords || {}, managedGroupId: s.settings?.managedGroupId || '', awayMessage: typeof s.settings?.awayMessage === 'string' ? s.settings.awayMessage : settings.awayMessage, welcomeMessage: typeof s.settings?.welcomeMessage === 'string' ? s.settings.welcomeMessage : settings.welcomeMessage, goodbyeMessage: typeof s.settings?.goodbyeMessage === 'string' ? s.settings.goodbyeMessage : settings.goodbyeMessage, replyCooldownSeconds: Number.isInteger(s.settings?.replyCooldownSeconds) ? Math.min(60, Math.max(1, s.settings.replyCooldownSeconds)) : settings.replyCooldownSeconds, goodbye: s.settings?.goodbye === true, textOnly: s.settings?.textOnly !== false, blockPhoneNumbers: s.settings?.blockPhoneNumbers !== false, blockBusinessPromo: s.settings?.blockBusinessPromo !== false, deleteMedia: s.settings?.deleteMedia !== false, blockAdultWords: s.settings?.blockAdultWords !== false };
   }
 } catch (e) { logger.warn({ err: String(e) }, 'Could not load saved settings'); }
-// One-time migration: persist the strict moderation policy requested by the owner.
-if (settings.moderationPolicyVersion !== 2) {
+// One-time migration: enforce strict, all-group moderation even if older saved settings were permissive.
+if (settings.moderationPolicyVersion !== 3) {
   settings.antiLink = true;
   settings.textOnly = true;
   settings.blockPhoneNumbers = true;
   settings.blockBusinessPromo = true;
   settings.deleteMedia = true;
-  settings.moderationPolicyVersion = 2;
+  settings.blockAdultWords = true;
+  settings.moderationPolicyVersion = 3;
   saveState();
 }
 function saveState() {
@@ -442,6 +443,7 @@ app.post('/api/settings', auth, (req,res) => {
   settings.blockPhoneNumbers = true;
   settings.blockBusinessPromo = true;
   settings.deleteMedia = true;
+  settings.blockAdultWords = true;
   for (const key of ['awayMessage','welcomeMessage','goodbyeMessage']) if (typeof req.body?.[key] === 'string' && req.body[key].length <= 1000) settings[key] = req.body[key].trim();
   if (Number.isInteger(req.body?.replyCooldownSeconds) && req.body.replyCooldownSeconds >= 1 && req.body.replyCooldownSeconds <= 60) settings.replyCooldownSeconds = req.body.replyCooldownSeconds;
   if (typeof req.body?.managedGroupId === 'string' && (req.body.managedGroupId === '' || req.body.managedGroupId.endsWith('@g.us'))) settings.managedGroupId = req.body.managedGroupId;
@@ -487,9 +489,7 @@ async function moderateLink(msg, groupId, meta) {
   try { await sock.sendMessage(groupId, { delete: msg.key }); eventStore.add('moderation_action', { category:'link', outcome:'deleted' }); await sendText(groupId, '⚠️ Link removed. Please follow group rules.'); return true; }
   catch (e) { logger.warn({ err:String(e) }, 'Link moderation failed'); return false; }
 }
-function getText(m={}) {
-  return m.conversation || m.extendedTextMessage?.text || m.imageMessage?.caption || m.videoMessage?.caption || m.documentMessage?.caption || m.buttonsResponseMessage?.selectedButtonId || m.listResponseMessage?.singleSelectReply?.selectedRowId || '';
-}
+function getText(m={}) { return getMessageText(m); }
 async function startBot() {
   if (starting) return; starting = true; connectionState = 'connecting';
   try {
@@ -554,21 +554,16 @@ async function startBot() {
           if (isGroup) { try { meta = await sock.groupMetadata(jid); } catch {} }
           const sender = msg.key.participant || jid;
           if (isGroup) {
-            // Enforce text-only moderation in every group, not just a single selected group.
-            // Baileys can wrap messages in ephemeral/view-once containers.
-            const body = msg.message || {};
-            const wrapped = body.ephemeralMessage?.message || body.viewOnceMessage?.message || body.viewOnceMessageV2?.message || body;
-            const metadataKeys = new Set(['messageContextInfo', 'senderKeyDistributionMessage']);
-            const contentKeys = Object.keys(wrapped).filter(k => !metadataKeys.has(k));
-            const hasNonText = contentKeys.some(k => !['conversation', 'extendedTextMessage'].includes(k));
-            const rawText = getText(wrapped).trim();
-            const hasLink = hasUrlLikeContent(rawText)
-              || Boolean(wrapped.extendedTextMessage?.contextInfo?.externalAdReply?.sourceUrl);
-            const hasPhone = settings.blockPhoneNumbers && /(?:\+?\d[\d .()\-]{7,}\d)/.test(rawText);
-            const hasPromo = settings.blockBusinessPromo && hasBusinessPromotion(rawText);
-            const violation = (settings.textOnly && hasNonText) || hasLink || hasPhone || hasPromo;
+            // Strict policy is global: inspect nested ephemeral/view-once/media wrappers,
+            // and block links, phone numbers, promotions, and adult/profane words for all members.
+            const violation = getMessageModerationViolation(msg.message || {}, {
+              textOnly: settings.textOnly !== false,
+              blockPhoneNumbers: settings.blockPhoneNumbers !== false,
+              blockBusinessPromo: settings.blockBusinessPromo !== false,
+              blockAdultWords: settings.blockAdultWords !== false
+            });
             if (violation) {
-              const reason = hasNonText ? 'non-text content' : hasLink ? 'link' : hasPhone ? 'phone number' : 'business promotion';
+              const reason = violation.reason;
               const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
               let deleted = false;
               if (settings.deleteMedia && isAdmin(meta, getSessionJidCandidates())) {
@@ -603,10 +598,12 @@ async function startBot() {
             }
             if (await moderateLink(msg, jid, meta)) continue;
             const bad = settings.blockedWords[jid] || [];
-            if (text && bad.some(w => w && text.toLowerCase().includes(w.toLowerCase())) && !isAdmin(meta, sender)) {
+            if (text && hasBlockedWordContent(text, bad)) {
               eventStore.add('moderation_action', { category:'blocked_word', outcome:'triggered' });
               if (isAdmin(meta, getSessionJidCandidates())) await sock.sendMessage(jid, { delete: msg.key }).catch(() => {});
-              await sendText(jid, '⚠️ Please keep the group respectful and follow its rules.', msg);
+              const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+              const warnings = addWarning(jid, sender, botJid, 'blocked word');
+              await sendText(jid, '⚠️ Please keep the group respectful and follow its rules. Warning ' + warnings.length + '.', msg);
               continue;
             }
           }
