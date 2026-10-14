@@ -8,7 +8,7 @@ NEXBOT PRO is a self-hosted WhatsApp automation and group-moderation worker. It 
 - Protected API routes using the `x-panel-key` header (the key is never accepted in a URL).
 - WhatsApp connection state, protected QR retrieval, reconnect control, and health endpoint at `/health`.
 - Existing command handlers and permission checks for supported group operations.
-- Global text-only group moderation: removes non-text payloads (media, voice notes, stickers, documents, contacts, locations, polls, and similar message types), links, phone-number-like text, and common promotion phrases across all groups; records a warning for the sender.
+- Strict all-group moderation: rejects non-text payloads (including nested/view-once media, voice notes, stickers, documents, contacts, locations, polls, product/business cards, and interactive messages), links, phone-number-like text, promotion phrases, and common obscene/adult/profane terms, including common punctuation/leet evasion; records warnings. Deletion requires NEXBOT to be a group admin.
 - Group metadata, participant lists, subject/description changes, invite controls, and member administration where WhatsApp permissions allow.
 - Persisted bot settings, warnings, blocked words, group replies, and workflows on the `DATA_DIR` volume.
 - Workflow editor and backend execution for incoming-message triggers, match conditions, sender/group conditions, delays, text replies, event labels, optional AI responses, and allowlisted HTTPS webhooks.
@@ -62,6 +62,6 @@ Manual verification still requires the owner's WhatsApp account and (for group o
 - Official WhatsApp Business Platform onboarding, approved templates, and pricing are separate and may incur charges.
 - Do not use the bot for unsolicited bulk messaging, spam, scraping, or unauthorized access to conversations.
 - Group actions succeed only when WhatsApp confirms the operation and the bot has sufficient permissions. For moderation, NEXBOT must be an admin in each group to delete violating messages; if it lacks permission, it can warn but cannot guarantee deletion.
-- Promotion detection is pattern-based and can miss new wording or flag an ordinary message that resembles an advert. It is not a perfect filter, and group rules should be tested with a small group first.
+- Moderation is pattern-based, not AI-perfect: new slang or heavily disguised terms may evade it, and some ordinary text may be flagged. Actual WhatsApp voice/video calls are not reliably blockable through this unofficial integration; call links and message payloads are filtered when WhatsApp exposes them as messages. Test in a small group first.
 - Never share `PANEL_KEY`, a live QR code, API keys, or session files. The settings backup intentionally excludes WhatsApp authentication credentials.
 - Do not claim live commands or group moderation are verified until tested with the account owner’s connected WhatsApp session.
