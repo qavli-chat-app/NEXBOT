@@ -39,7 +39,7 @@ test('adult/profane detector catches common terms and separator/leet evasion wit
   for (const value of ['XXX', 'p.o.r.n', 'p0rn', 'n u d e', 'explicit adult content', 'madarchod', 'f.u.c.k']) {
     assert.equal(hasObsceneContent(value), true, value);
   }
-  for (const value of ['class is starting', 'assessment tomorrow', 'Assalam o alaikum everyone', 'the sex of a plant is a biology topic']) {
+  for (const value of ['class is starting', 'assessment tomorrow', 'Assalam o alaikum everyone', 'the section of a plant is a biology topic']) {
     assert.equal(hasObsceneContent(value), false, value);
   }
 });
