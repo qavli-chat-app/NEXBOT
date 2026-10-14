@@ -75,7 +75,7 @@ function scheduleReconnect(reason = 'connection closed') {
   }, delay);
   reconnectTimer.unref?.();
 }
-let settings = { antiLink: true, antiSpam: true, welcome: true, goodbye: false, privateProtection: true, awayMessage:'I am not accepting private messages. Please do not message me.', welcomeMessage:'👋 Welcome @{{user}}! Please read the group rules.', goodbyeMessage:'Goodbye @{{user}}. Take care!', fallbackReplies:{}, replyCooldownSeconds:3, groups: {}, warnings: {}, rules: {}, customReplies: {}, blockedWords: {}, managedGroupId: '', textOnly: true, blockPhoneNumbers: true, blockBusinessPromo: true, deleteMedia: true, blockAdultWords: true, moderationPolicyVersion: 3 };
+let settings = { antiLink: true, antiSpam: true, welcome: true, goodbye: false, privateProtection: true, awayMessage:'I am not accepting private messages. Please do not message me.', welcomeMessage:'👋 Welcome @{{user}}! Please read the group rules.', goodbyeMessage:'Goodbye @{{user}}. Take care!', fallbackReplies:{}, replyCooldownSeconds:3, groups: {}, warnings: {}, rules: {}, customReplies: {}, blockedWords: {}, managedGroupId: '', textOnly: true, blockPhoneNumbers: true, blockBusinessPromo: true, deleteMedia: true, blockAdultWords: true, moderationPolicyVersion: 4 };
 let messageCount = 0, commandCount = 0, lastMessageAt = null;
 const recentMessages = new Map(), privateReplyAt = new Map(), commandCooldown = new Map(), processedMessageIds = new Map();
 const cooldown = (key, ms) => { const now=Date.now(), prev=commandCooldown.get(key)||0; if(now-prev<ms) return false; commandCooldown.set(key,now); return true; };
@@ -85,15 +85,16 @@ try {
     settings = { ...settings, ...(s.settings || {}), groups: s.settings?.groups || {}, warnings: s.settings?.warnings || {}, rules: s.settings?.rules || {}, customReplies: s.settings?.customReplies || {}, fallbackReplies: s.settings?.fallbackReplies || {}, blockedWords: s.settings?.blockedWords || {}, managedGroupId: s.settings?.managedGroupId || '', awayMessage: typeof s.settings?.awayMessage === 'string' ? s.settings.awayMessage : settings.awayMessage, welcomeMessage: typeof s.settings?.welcomeMessage === 'string' ? s.settings.welcomeMessage : settings.welcomeMessage, goodbyeMessage: typeof s.settings?.goodbyeMessage === 'string' ? s.settings.goodbyeMessage : settings.goodbyeMessage, replyCooldownSeconds: Number.isInteger(s.settings?.replyCooldownSeconds) ? Math.min(60, Math.max(1, s.settings.replyCooldownSeconds)) : settings.replyCooldownSeconds, goodbye: s.settings?.goodbye === true, textOnly: s.settings?.textOnly !== false, blockPhoneNumbers: s.settings?.blockPhoneNumbers !== false, blockBusinessPromo: s.settings?.blockBusinessPromo !== false, deleteMedia: s.settings?.deleteMedia !== false, blockAdultWords: s.settings?.blockAdultWords !== false };
   }
 } catch (e) { logger.warn({ err: String(e) }, 'Could not load saved settings'); }
-// One-time migration: enforce strict, all-group moderation even if older saved settings were permissive.
-if (settings.moderationPolicyVersion !== 3) {
+// One-time migration: strict moderation is locked on globally and cannot be relaxed per group or through the dashboard.
+if (settings.moderationPolicyVersion !== 4 || settings.antiSpam !== true || settings.antiLink !== true) {
   settings.antiLink = true;
+  settings.antiSpam = true;
   settings.textOnly = true;
   settings.blockPhoneNumbers = true;
   settings.blockBusinessPromo = true;
   settings.deleteMedia = true;
   settings.blockAdultWords = true;
-  settings.moderationPolicyVersion = 3;
+  settings.moderationPolicyVersion = 4;
   saveState();
 }
 function saveState() {
@@ -439,6 +440,7 @@ app.post('/api/settings', auth, (req,res) => {
   for (const key of allowed) if (typeof req.body?.[key] === 'boolean') settings[key] = req.body[key];
   // Strict owner-requested group policy cannot be switched off from the dashboard/API.
   settings.antiLink = true;
+  settings.antiSpam = true;
   settings.textOnly = true;
   settings.blockPhoneNumbers = true;
   settings.blockBusinessPromo = true;
@@ -452,7 +454,7 @@ app.post('/api/settings', auth, (req,res) => {
 app.get('/dashboard', (_req,res) => res.sendFile(path.join(process.cwd(), 'dashboard.html')));
 
 const groupDefaults = { antiLink: settings.antiLink, antiSpam: settings.antiSpam, welcome: settings.welcome, goodbye:settings.goodbye };
-function groupSettings(id) { return { ...groupDefaults, ...(settings.groups[id] || {}) }; }
+function groupSettings(id) { return { ...groupDefaults, ...(settings.groups[id] || {}), antiLink:true, antiSpam:true }; }
 function warnKey(groupId, userId) { return groupId + '|' + userId; }
 function getWarnings(groupId,userId) { return settings.warnings[warnKey(groupId,userId)] || []; }
 function addWarning(groupId,userId,by,reason) { const k=warnKey(groupId,userId); const arr=getWarnings(groupId,userId); arr.push({by,reason:reason||'No reason provided',at:new Date().toISOString()}); settings.warnings[k]=arr.slice(-20); saveState(); return settings.warnings[k]; }
@@ -571,11 +573,22 @@ async function startBot() {
                 catch (e) { logger.warn({ err:String(e), groupId:jid }, 'Could not delete a text-only rule violation'); }
               }
               const warnings = addWarning(jid, sender, botJid, reason);
+              let removedForRepeatedViolations = false;
+              if (warnings.length >= 3 && sender !== botJid && !isAdmin(meta, sender) && isAdmin(meta, getSessionJidCandidates())) {
+                try {
+                  await sock.groupParticipantsUpdate(jid, [sender], 'remove');
+                  delete settings.warnings[warnKey(jid, sender)];
+                  saveState();
+                  removedForRepeatedViolations = true;
+                } catch (e) {
+                  logger.warn({ err:String(e), groupId:jid }, 'Could not remove member after repeated moderation violations');
+                }
+              }
               eventStore.add('moderation_action', {
-                category:'text_only',
-                outcome: deleted ? 'deleted_and_warned' : (!meta ? 'admin_status_unknown_warned' : (isAdmin(meta, getSessionJidCandidates()) ? 'delete_failed_warned' : 'bot_not_admin_warned'))
+                category:'strict_group_policy',
+                outcome: removedForRepeatedViolations ? 'deleted_warned_member_removed' : (deleted ? 'deleted_and_warned' : (!meta ? 'admin_status_unknown_warned' : (isAdmin(meta, getSessionJidCandidates()) ? 'delete_failed_warned' : 'bot_not_admin_warned')))
               });
-              const warningText = '⚠️ @' + sender.split('@')[0] + ': this group allows text messages only. Media, links, phone numbers and business promotions are not allowed. Warning ' + warnings.length + '.';
+              const warningText = '🚫 @' + sender.split('@')[0] + ': group policy violation (' + reason + '). Text-only groups: no media, links, phone numbers, promotions, or adult/profane words. Warning ' + warnings.length + '/3.' + (removedForRepeatedViolations ? ' Member removed after repeated violations.' : '');
               await sock.sendMessage(jid, { text:warningText, mentions:[sender] }).catch(() => {});
               continue;
             }
@@ -589,10 +602,17 @@ async function startBot() {
               if (arr.length >= 6 && !isAdmin(meta,sender)) {
                 eventStore.add('moderation_action', { category:'anti_spam', outcome:'triggered' });
                 recentMessages.set(key, []);
-                await sendText(jid, '⚠️ Please slow down; anti-spam detected rapid messages.', msg);
+                let deleted = false;
                 if (isAdmin(meta, getSessionJidCandidates())) {
-                  try { await sock.sendMessage(jid,{delete:msg.key}); } catch {}
+                  try { await sock.sendMessage(jid,{delete:msg.key}); deleted = true; } catch (e) { logger.warn({err:String(e),groupId:jid},'Could not delete spam message'); }
                 }
+                const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+                const warnings = addWarning(jid, sender, botJid, 'rapid message spam');
+                let removed = false;
+                if (warnings.length >= 3 && isAdmin(meta, getSessionJidCandidates())) {
+                  try { await sock.groupParticipantsUpdate(jid,[sender],'remove'); delete settings.warnings[warnKey(jid,sender)]; saveState(); removed = true; } catch (e) { logger.warn({err:String(e),groupId:jid},'Could not remove repeated spammer'); }
+                }
+                await sock.sendMessage(jid,{text:'🚫 @'+sender.split('@')[0]+': rapid messaging is not allowed. Warning '+warnings.length+'/3.'+(removed?' Member removed after repeated violations.':(!deleted?' Please note: the bot needs admin permission to delete messages.':'')),mentions:[sender]}).catch(()=>{});
                 continue;
               }
             }
@@ -702,6 +722,7 @@ async function startBot() {
               const value = (args[0] || '').toLowerCase();
               if (!['on','off'].includes(value)) { await reply('Usage: ' + PREFIX + cmd + ' on|off'); continue; }
               const field = cmd === 'antilink' ? 'antiLink' : cmd === 'antispam' ? 'antiSpam' : 'welcome';
+              if (['antilink','antispam'].includes(cmd) && value === 'off') { await reply('🔒 Strict group moderation is locked on by the owner and cannot be disabled.'); continue; }
               settings.groups[jid] = { ...groupSettings(jid), [field]: value === 'on' };
               saveState(); await reply('✅ ' + cmd + ' ' + value + ' for this group.');
             }
