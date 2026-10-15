@@ -117,6 +117,37 @@ function cryptoSafeEqual(a,b) {
 import { timingSafeEqual as timingEqual } from 'node:crypto';
 const requireCrypto = { timingSafeEqual: timingEqual };
 const esc = (s='') => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+app.get('/', (_req,res) => {
+  res.set('Cache-Control', 'no-store');
+  res.type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#090d1c"><meta name="description" content="NEXBOT PRO — WhatsApp group moderation, connection status, and secure bot control dashboard.">
+<title>NEXBOT PRO — Control Center</title>
+<style>
+:root{color-scheme:dark;--bg:#090d1c;--panel:#111a2e;--line:#24334f;--muted:#a5b3cc;--text:#f5f7ff;--cyan:#64e6dc;--blue:#7197ff}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 12% 0%,#17264a 0,transparent 43%),radial-gradient(ellipse at 100% 25%,#143a40 0,transparent 32%),var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;min-height:100vh}
+.wrap{width:min(1080px,calc(100% - 32px));margin:auto}.nav{display:flex;align-items:center;justify-content:space-between;padding:24px 0;border-bottom:1px solid #ffffff12}.brand{display:flex;align-items:center;gap:12px;font-weight:850;letter-spacing:.12em}.logo{width:42px;height:42px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(135deg,var(--cyan),var(--blue));color:#09111e;font-size:21px;font-weight:950;box-shadow:0 8px 28px #64e6dc30}.chip{border:1px solid var(--line);padding:7px 11px;border-radius:999px;color:var(--muted);font-size:12px}
+.hero{padding:74px 0 48px;max-width:800px}.eyebrow{color:var(--cyan);font-size:12px;letter-spacing:.2em;font-weight:800;text-transform:uppercase}.hero h1{font-size:clamp(42px,8vw,76px);line-height:1.02;letter-spacing:-.055em;margin:18px 0}.hero h1 span{background:linear-gradient(100deg,#fff,var(--cyan),#9eb3ff);background-clip:text;color:transparent}.hero p{font-size:18px;color:var(--muted);max-width:650px}.actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:28px}.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;min-height:48px;padding:0 19px;border-radius:14px;text-decoration:none;font-weight:800;border:1px solid var(--line);transition:transform .15s,border-color .15s}.btn:hover{transform:translateY(-2px);border-color:#64e6dc88}.primary{background:linear-gradient(120deg,var(--cyan),#9db6ff);color:#081321;border:0}.secondary{background:#ffffff08;color:var(--text)}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:12px 0 52px}.card{background:linear-gradient(160deg,#ffffff0a,#ffffff04);border:1px solid var(--line);border-radius:20px;padding:22px;min-height:156px}.ico{font-size:24px}.card h2{font-size:16px;margin:12px 0 6px}.card p{font-size:14px;color:var(--muted);margin:0}.status{display:flex;align-items:center;gap:9px;margin-top:24px;color:var(--muted);font-size:13px}.dot{width:9px;height:9px;border-radius:50%;background:#f6c96a;box-shadow:0 0 14px #f6c96a55}.dot.ok{background:#61e7a5;box-shadow:0 0 14px #61e7a555}.dot.bad{background:#ff7c8d;box-shadow:0 0 14px #ff7c8d55}.foot{padding:22px 0 30px;border-top:1px solid #ffffff12;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;color:#8392ad;font-size:12px}.foot a{color:#b7c9ed;text-decoration:none}
+@media(max-width:700px){.hero{padding:52px 0 34px}.grid{grid-template-columns:1fr}.card{min-height:0}.nav{padding:17px 0}.hero p{font-size:16px}}@media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
+</style></head>
+<body><div class="wrap">
+<header class="nav"><div class="brand"><div class="logo">N</div><span>NEXBOT <span style="color:var(--cyan)">PRO</span></span></div><span class="chip">WHATSAPP CONTROL CENTER</span></header>
+<main><section class="hero"><div class="eyebrow">Secure · Practical · Admin-first</div><h1>Group control.<br><span>Without the chaos.</span></h1><p>NEXBOT PRO helps you manage WhatsApp group moderation, inspect connection health, and configure bot workflows from one mobile-friendly control center.</p>
+<div class="actions"><a class="btn primary" href="/dashboard">Open Control Dashboard <span aria-hidden="true">↗</span></a><a class="btn secondary" href="/pair">Connect WhatsApp <span aria-hidden="true">→</span></a></div>
+<div class="status" aria-live="polite"><span id="dot" class="dot"></span><span id="status">Checking service health…</span></div></section>
+<section class="grid" aria-label="NEXBOT capabilities">
+<article class="card"><div class="ico">🛡️</div><h2>Strict group moderation</h2><p>Text-only policy and checks for links, spam, promotions, and prohibited content. Deletion depends on group-admin permissions.</p></article>
+<article class="card"><div class="ico">📊</div><h2>One control dashboard</h2><p>Review bot status, group settings, event history, analytics, workflows, and supported admin actions.</p></article>
+<article class="card"><div class="ico">🔐</div><h2>Private by design</h2><p>Dashboard APIs require your private panel key. Never put the key in a URL or share your live pairing QR.</p></article>
+</section></main>
+<footer class="foot"><span>© <span id="year"></span> NEXBOT PRO · Independent community project</span><span><a href="/health">Service health</a> · <a href="/dashboard">Dashboard</a> · <a href="/pair">Pairing</a></span></footer>
+</div><script>
+document.getElementById('year').textContent=String(new Date().getFullYear());
+fetch('/health',{cache:'no-store'}).then(r=>{if(!r.ok)throw new Error('health');return r.json()}).then(d=>{document.getElementById('dot').className='dot ok';document.getElementById('status').textContent=d.connected?'Service online · WhatsApp connected':'Service online · WhatsApp '+String(d.state||'status unavailable').replace(/_/g,' ')}).catch(()=>{document.getElementById('dot').className='dot bad';document.getElementById('status').textContent='Service health could not be checked. Open the dashboard to inspect.'});
+</script></body></html>`);
+});
 app.get('/health', (_req,res) => res.json({ ok:true, service:'NEXBOT Pro', state:connectionState, connected, uptimeSeconds:Math.floor((Date.now()-startedAt)/1000), messageCount, commandCount, lastMessageAt, lastDisconnect }));
 app.get('/api/status', auth, (_req,res) => res.json({ service:'NEXBOT Pro', state:connectionState, connected, qrAvailable:!!latestQR, commandPrefix:PREFIX, uptimeSeconds:Math.floor((Date.now()-startedAt)/1000), messageCount, commandCount, lastMessageAt, lastDisconnect, settings }));
 app.get('/api/events', auth, (req,res) => {
