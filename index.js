@@ -451,6 +451,41 @@ app.post('/api/settings', auth, (req,res) => {
   if (typeof req.body?.managedGroupId === 'string' && (req.body.managedGroupId === '' || req.body.managedGroupId.endsWith('@g.us'))) settings.managedGroupId = req.body.managedGroupId;
   saveState(); res.json({ ok:true, settings });
 });
+app.post('/api/pairing/reset', auth, (_req,res) => {
+  if (connected) return res.status(409).json({ error:'WhatsApp is already connected.' });
+  if (starting) return res.status(409).json({ error:'Pairing startup is already in progress. Wait a moment and refresh.' });
+  if (connectionState !== 'logged_out') return res.status(409).json({ error:'A new pairing reset is only available after WhatsApp reports Logged Out. Current state: '+connectionState, state:connectionState });
+  try {
+    // Preserve the logged-out credentials for recovery; never delete the existing auth folder.
+    const backupDir = path.join(DATA_DIR, 'auth-logged-out-backup-' + new Date().toISOString().replace(/[:.]/g, '-'));
+    if (fs.existsSync(AUTH_DIR)) fs.renameSync(AUTH_DIR, backupDir);
+    fs.mkdirSync(AUTH_DIR, { recursive:true });
+    latestQR = '';
+    connected = false;
+    connectionState = 'starting';
+    eventStore.add('connection_changed', { state:'pairing_reset_started' });
+    void startBot();
+    res.status(202).json({ ok:true, state:connectionState, message:'A fresh pairing session is starting. Keep this page open; the QR should appear shortly.' });
+  } catch (e) {
+    connectionState = 'error';
+    logger.error({ err:String(e) }, 'Could not initialize fresh WhatsApp pairing');
+    res.status(500).json({ error:'Could not initialize a fresh pairing session. Existing credentials were preserved where possible.' });
+  }
+});
+app.get('/pair', (_req,res) => res.type('html').send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NEXBOT WhatsApp Pairing</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#0b1020;color:#edf2ff}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;background:radial-gradient(ellipse at top,#1a3150,#0b1020 65%)}main{width:min(100%,520px);padding:24px;border:1px solid #2b3a58;border-radius:22px;background:#101a2d;box-shadow:0 24px 70px #0006}h1{margin:0 0 8px;font-size:27px}p{color:#aebbd3;line-height:1.55}.pill{display:inline-block;padding:6px 10px;border-radius:99px;background:#1e3550;color:#8ee8c0;font-size:12px;font-weight:700;letter-spacing:.08em}label{display:block;margin:18px 0 7px;color:#c8d4e8;font-size:14px}input,button{width:100%;padding:13px;border-radius:11px;border:1px solid #344765;font:inherit}input{background:#0b1324;color:#fff}button{margin-top:10px;background:#73e2b1;color:#062219;border:0;font-weight:750;cursor:pointer}button.secondary{background:#243651;color:#eef5ff}button:disabled{opacity:.5;cursor:wait}#status{padding:12px;border-radius:10px;background:#0b1324;margin-top:15px;white-space:pre-wrap;font-size:14px}#qr{margin:18px auto 0;text-align:center}#qr img{max-width:min(100%,300px);background:#fff;padding:10px;border-radius:12px}small{color:#91a2bf} .warn{color:#ffd58a}
+</style></head><body><main><span class="pill">NEXBOT PRO · PRIVATE PAIRING</span><h1>Connect WhatsApp</h1><p>Enter the private Railway <b>PANEL_KEY</b> to load the pairing status. Keep this key private and do not share the QR code.</p>
+<label for="key">Private PANEL_KEY</label><input id="key" type="password" autocomplete="off" placeholder="Paste your PANEL_KEY"><button id="check">Check connection / show QR</button><button id="new" class="secondary" hidden>Start fresh pairing</button><div id="status">Waiting for secure dashboard access.</div><div id="qr"></div><p class="warn"><small>When the QR appears: WhatsApp → Linked devices → Link a device → scan the QR. The QR is private and expires; refresh it if needed.</small></p></main>
+<script>
+const key=document.getElementById('key'),statusBox=document.getElementById('status'),qrBox=document.getElementById('qr'),checkBtn=document.getElementById('check'),newBtn=document.getElementById('new');let timer=null;
+async function api(url,options={}){const r=await fetch(url,{...options,headers:{'x-panel-key':key.value.trim(),...(options.headers||{}),'Content-Type':'application/json'},cache:'no-store'});let d;try{d=await r.json()}catch{d={error:'Unexpected server response'}}if(!r.ok)throw Error(d.error||'Request failed ('+r.status+')');return d}
+function showStatus(s){statusBox.textContent=s}
+async function refresh(){try{const s=await api('/api/status');showStatus('Connection state: '+s.state+'\nWhatsApp connected: '+s.connected);newBtn.hidden=s.state!=='logged_out';if(s.connected){qrBox.innerHTML='';showStatus('WhatsApp is already connected.');clearInterval(timer);return}if(s.qrAvailable||s.state==='qr'){const q=await api('/api/qr');if(q.qr){qrBox.innerHTML='<img alt="WhatsApp pairing QR code" src="'+q.qr+'">';showStatus('QR ready. Scan it from WhatsApp Linked devices.');newBtn.hidden=true;return}}qrBox.innerHTML='';if(s.state==='logged_out')showStatus('WhatsApp session is logged out. Tap “Start fresh pairing” to create a new QR.');else showStatus('Waiting for QR… keep this page open and try again in a few seconds.')}catch(e){showStatus(e.message)}}
+checkBtn.onclick=async()=>{checkBtn.disabled=true;qrBox.innerHTML='';try{await refresh();if(timer)clearInterval(timer);timer=setInterval(refresh,2500)}finally{checkBtn.disabled=false}};
+newBtn.onclick=async()=>{if(!confirm('Start a new WhatsApp pairing session? Existing logged-out auth files will be preserved in a backup folder.'))return;newBtn.disabled=true;try{const d=await api('/api/pairing/reset',{method:'POST',body:'{}'});showStatus(d.message||'Pairing started. Waiting for QR…');qrBox.innerHTML='';if(timer)clearInterval(timer);timer=setInterval(refresh,2500);setTimeout(refresh,1500)}catch(e){showStatus(e.message)}finally{newBtn.disabled=false}};
+</script></body></html>`));
 app.get('/dashboard', (_req,res) => res.sendFile(path.join(process.cwd(), 'dashboard.html')));
 
 const groupDefaults = { antiLink: settings.antiLink, antiSpam: settings.antiSpam, welcome: settings.welcome, goodbye:settings.goodbye };
