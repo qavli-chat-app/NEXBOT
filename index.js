@@ -556,7 +556,7 @@ async function sendText(jid, text, quoted) {
 async function moderateLink(msg, groupId, meta) {
   const text = getText(msg.message);
   const gs = groupSettings(groupId);
-  if (!gs.antiLink || !text || !/(https?:\/\/|www\.|chat\.whatsapp\.com\/)/i.test(text)) return false;
+  if (!gs.antiLink || !text || !hasUrlLikeContent(text)) return false;
   const sender = msg.key.participant || msg.key.remoteJid;
   if (isAdmin(meta, sender) || sender === OWNER + '@s.whatsapp.net') return false;
   const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
