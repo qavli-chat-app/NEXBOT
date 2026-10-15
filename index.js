@@ -8,7 +8,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import { createEventStore } from './lib/event-store.js';
 import { createWorkflowEngine } from './lib/workflow-engine.js';
-import { getMessageModerationViolation, getMessageText, hasBlockedWordContent, isGroupAdmin, getAdminVerification } from './lib/moderation.js';
+import { getMessageModerationViolation, getMessageText, hasBlockedWordContent, hasUrlLikeContent, isGroupAdmin, getAdminVerification } from './lib/moderation.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -634,7 +634,15 @@ async function startBot() {
           const isGroup = jid.endsWith('@g.us');
           eventStore.add('message_received', { category:isGroup ? 'group' : 'private' });
           let meta = null;
-          if (isGroup) { try { meta = await sock.groupMetadata(jid); } catch {} }
+          if (isGroup) {
+            try { meta = await sock.groupMetadata(jid); }
+            catch (firstError) {
+              logger.warn({ err:String(firstError), groupId:jid }, 'Initial group metadata lookup failed; retrying once before moderation');
+              await new Promise(resolve => setTimeout(resolve, 300));
+              try { meta = await sock.groupMetadata(jid); }
+              catch (retryError) { logger.error({ err:String(retryError), groupId:jid }, 'Group metadata unavailable; moderation deletion cannot be safely authorized'); }
+            }
+          }
           const sender = msg.key.participant || jid;
           if (isGroup) {
             // Strict policy is global: inspect nested ephemeral/view-once/media wrappers,
@@ -648,8 +656,10 @@ async function startBot() {
             if (violation) {
               const reason = violation.reason;
               const botJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+              const botAdminVerified = isAdmin(meta, getSessionJidCandidates());
+              logger.info({ groupId:jid, reason, metadataAvailable:Boolean(meta), participantCount:meta?.participants?.length || 0, botAdminVerified, deleteEnabled:settings.deleteMedia, messageTypes:Object.keys(msg.message || {}).filter(k => !['messageContextInfo','senderKeyDistributionMessage','messageSecretMessage','protocolMessage'].includes(k)) }, 'Group moderation violation detected');
               let deleted = false;
-              if (settings.deleteMedia && isAdmin(meta, getSessionJidCandidates())) {
+              if (settings.deleteMedia && botAdminVerified) {
                 try { await sock.sendMessage(jid, { delete: msg.key }); deleted = true; }
                 catch (e) { logger.warn({ err:String(e), groupId:jid }, 'Could not delete a text-only rule violation'); }
               }
@@ -665,10 +675,9 @@ async function startBot() {
                   logger.warn({ err:String(e), groupId:jid }, 'Could not remove member after repeated moderation violations');
                 }
               }
-              eventStore.add('moderation_action', {
-                category:'strict_group_policy',
-                outcome: removedForRepeatedViolations ? 'deleted_warned_member_removed' : (deleted ? 'deleted_and_warned' : (!meta ? 'admin_status_unknown_warned' : (isAdmin(meta, getSessionJidCandidates()) ? 'delete_failed_warned' : 'bot_not_admin_warned')))
-              });
+              const moderationOutcome = removedForRepeatedViolations ? 'deleted_warned_member_removed' : (deleted ? 'deleted_and_warned' : (!meta ? 'admin_status_unknown_warned' : (botAdminVerified ? 'delete_failed_warned' : 'bot_not_admin_warned')));
+              eventStore.add('moderation_action', { category:'strict_group_policy', outcome:moderationOutcome });
+              if (!deleted) logger.warn({ groupId:jid, reason, moderationOutcome, botAdminVerified, deleteEnabled:settings.deleteMedia }, 'Moderation violation was detected but message was not deleted');
               const warningText = '🚫 @' + sender.split('@')[0] + ': group policy violation (' + reason + '). Text-only groups: no media, links, phone numbers, promotions, or adult/profane words. Warning ' + warnings.length + '/3.' + (removedForRepeatedViolations ? ' Member removed after repeated violations.' : '');
               await sock.sendMessage(jid, { text:warningText, mentions:[sender] }).catch(() => {});
               continue;
