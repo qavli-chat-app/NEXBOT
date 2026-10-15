@@ -59,6 +59,7 @@ const groupActionLimit = makeRateLimiter({ max:30 });
 let sock = null, latestQR = '', connected = false, connectionState = 'starting';
 let lastDisconnect = null, starting = false, reconnectTimer = null, startedAt = Date.now();
 let reconnectAttempts = 0;
+let automaticFreshPairingAttempted = false;
 const RECONNECT_BASE_MS = 3000;
 const RECONNECT_MAX_MS = 60000;
 function scheduleReconnect(reason = 'connection closed') {
@@ -451,25 +452,31 @@ app.post('/api/settings', auth, (req,res) => {
   if (typeof req.body?.managedGroupId === 'string' && (req.body.managedGroupId === '' || req.body.managedGroupId.endsWith('@g.us'))) settings.managedGroupId = req.body.managedGroupId;
   saveState(); res.json({ ok:true, settings });
 });
+function beginFreshPairing(reason = 'manual') {
+  if (connected) throw new Error('WhatsApp is already connected.');
+  if (starting) throw new Error('Pairing startup is already in progress. Wait a moment and refresh.');
+  // Preserve the previous credentials for recovery instead of deleting them.
+  const backupDir = path.join(DATA_DIR, 'auth-logged-out-backup-' + new Date().toISOString().replace(/[:.]/g, '-'));
+  if (fs.existsSync(AUTH_DIR)) fs.renameSync(AUTH_DIR, backupDir);
+  fs.mkdirSync(AUTH_DIR, { recursive:true });
+  latestQR = '';
+  connected = false;
+  connectionState = 'starting';
+  eventStore.add('connection_changed', { state:'pairing_reset_started', reason });
+  logger.warn({ reason, backupDir }, 'Starting a fresh WhatsApp pairing session');
+  void startBot();
+}
 app.post('/api/pairing/reset', auth, (_req,res) => {
   if (connected) return res.status(409).json({ error:'WhatsApp is already connected.' });
   if (starting) return res.status(409).json({ error:'Pairing startup is already in progress. Wait a moment and refresh.' });
-  if (connectionState !== 'logged_out') return res.status(409).json({ error:'A new pairing reset is only available after WhatsApp reports Logged Out. Current state: '+connectionState, state:connectionState });
+  if (connectionState !== 'logged_out') return res.status(409).json({ error:'A fresh pairing can only start after WhatsApp reports Logged Out. Current state: '+connectionState, state:connectionState });
   try {
-    // Preserve the logged-out credentials for recovery; never delete the existing auth folder.
-    const backupDir = path.join(DATA_DIR, 'auth-logged-out-backup-' + new Date().toISOString().replace(/[:.]/g, '-'));
-    if (fs.existsSync(AUTH_DIR)) fs.renameSync(AUTH_DIR, backupDir);
-    fs.mkdirSync(AUTH_DIR, { recursive:true });
-    latestQR = '';
-    connected = false;
-    connectionState = 'starting';
-    eventStore.add('connection_changed', { state:'pairing_reset_started' });
-    void startBot();
-    res.status(202).json({ ok:true, state:connectionState, message:'A fresh pairing session is starting. Keep this page open; the QR should appear shortly.' });
+    beginFreshPairing('manual');
+    res.status(202).json({ ok:true, state:connectionState, message:'Fresh pairing started. Keep this page open; the QR should appear shortly.' });
   } catch (e) {
     connectionState = 'error';
     logger.error({ err:String(e) }, 'Could not initialize fresh WhatsApp pairing');
-    res.status(500).json({ error:'Could not initialize a fresh pairing session. Existing credentials were preserved where possible.' });
+    res.status(500).json({ error:e.message || 'Could not initialize a fresh pairing session. Previous credentials were preserved where possible.' });
   }
 });
 app.get('/pair', (_req,res) => res.type('html').send(`<!doctype html>
@@ -547,7 +554,15 @@ async function startBot() {
         eventStore.add('connection_changed', { state:code === DisconnectReason.loggedOut ? 'logged_out' : 'disconnected', code:code || 0 });
         if (code === DisconnectReason.loggedOut) {
           connectionState = 'logged_out';
-          logger.error({ code }, 'WhatsApp session logged out; manual re-pairing is required');
+          logger.error({ code }, 'WhatsApp session logged out; fresh pairing is required');
+          // Automatically create a fresh QR once per process when stored credentials are rejected.
+          // The old auth folder is backed up; no credentials are permanently deleted.
+          setTimeout(() => {
+            if (automaticFreshPairingAttempted || connected || starting || connectionState !== 'logged_out') return;
+            automaticFreshPairingAttempted = true;
+            try { beginFreshPairing('automatic-after-logged-out'); }
+            catch (e) { logger.error({ err:String(e) }, 'Automatic fresh pairing could not start'); }
+          }, 1500).unref?.();
         } else {
           connectionState = 'disconnected';
           scheduleReconnect('WhatsApp connection closed');
